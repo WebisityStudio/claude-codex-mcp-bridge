@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -23,7 +24,7 @@ test("setup plan registers the same built server with Claude and Codex", () => {
     "claude-codex-bridge",
     "--",
     "/usr/bin/node",
-    "/opt/claude-codex-mcp-bridge/dist/server.js",
+    join("/opt/claude-codex-mcp-bridge", "dist", "server.js"),
   ]);
   assert.deepEqual(plan.codex.add, [
     "codex",
@@ -32,7 +33,7 @@ test("setup plan registers the same built server with Claude and Codex", () => {
     "claude-codex-bridge",
     "--",
     "/usr/bin/node",
-    "/opt/claude-codex-mcp-bridge/dist/server.js",
+    join("/opt/claude-codex-mcp-bridge", "dist", "server.js"),
   ]);
 });
 
@@ -53,13 +54,13 @@ test("CLI command parser recognises supported commands and safe flags", () => {
 test("runtime installation uses a stable user-owned prefix", () => {
   assert.equal(
     resolveRuntimePrefix("/Users/example"),
-    "/Users/example/.local/share/claude-codex-bridge/runtime",
+    join("/Users/example", ".local", "share", "claude-codex-bridge", "runtime"),
   );
 });
 
 test("skill targets cover Claude and the shared agent-skills directory", () => {
   assert.deepEqual(resolveSkillTargets("/Users/example"), [
-    "/Users/example/.claude/skills",
-    "/Users/example/.agents/skills",
+    join("/Users/example", ".claude", "skills"),
+    join("/Users/example", ".agents", "skills"),
   ]);
 });
