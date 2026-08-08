@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.bridge-worktrees/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log
+.DS_Store
+Thumbs.db
+.local/
+runs/
