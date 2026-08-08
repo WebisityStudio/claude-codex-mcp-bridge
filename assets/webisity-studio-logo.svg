@@ -1,0 +1,76 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 600 400"
+  fill="none">
+
+  <defs>
+    <linearGradient id="leftGradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1fd1ff"/>
+      <stop offset="100%" stop-color="#0b3c66"/>
+    </linearGradient>
+
+    <linearGradient id="rightGradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffb347"/>
+      <stop offset="100%" stop-color="#1f6fff"/>
+    </linearGradient>
+
+    <linearGradient id="centerGradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2ee6ff"/>
+      <stop offset="100%" stop-color="#ff9f43"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Left W stroke -->
+  <path
+    d="M60 40
+       L140 360
+       L220 120
+       L300 360
+       L380 40"
+    stroke="url(#leftGradient)"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <!-- Inner left circuitry -->
+  <path
+    d="M95 60
+       L150 300
+       L220 150
+       L285 300
+       L340 60"
+    stroke="#4ddcff"
+    stroke-width="10"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <!-- Right W stroke -->
+  <path
+    d="M220 40
+       L300 360
+       L380 120
+       L460 360
+       L540 40"
+    stroke="url(#rightGradient)"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <!-- Inner right circuitry -->
+  <path
+    d="M255 60
+       L310 300
+       L380 150
+       L445 300
+       L500 60"
+    stroke="#ffb347"
+    stroke-width="10"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <!-- Circuit dots -->
+  <circle cx="150" cy="300" r="6" fill="#4ddcff"/>
+  <circle cx="220" cy="150" r="6" fill="#4ddcff"/>
+  <circle cx="285" cy="300" r="6" fill="#ffb347"/>
+  <circle cx="380" cy="150" r="6" fill="#ffb347"/>
+</svg>

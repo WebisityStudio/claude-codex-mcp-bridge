@@ -1,4 +1,12 @@
-# Claude Codex MCP Bridge
+<p align="center">
+  <a href="https://www.webisitystudio.co.uk/">
+    <img src="assets/webisity-studio-logo.svg" width="180" alt="WebiSity Studio logo">
+  </a>
+</p>
+
+<h1 align="center">Claude Codex MCP Bridge</h1>
+
+<p align="center">Built by <a href="https://www.webisitystudio.co.uk/">WebiSity Studio</a></p>
 
 [![CI](https://github.com/WebisityStudio/claude-codex-mcp-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/WebisityStudio/claude-codex-mcp-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
