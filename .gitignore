@@ -10,6 +10,7 @@ coverage/
 *.sqlite-wal
 *.db
 *.log
+*.tgz
 .DS_Store
 Thumbs.db
 .local/

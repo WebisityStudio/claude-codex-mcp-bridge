@@ -1,6 +1,27 @@
 # Operating instructions
 
-The bridge supports two distinct workflows. Pick one and use one canonical thread ID from the start.
+## Install and verify
+
+```bash
+npx --yes --package=github:WebisityStudio/claude-codex-mcp-bridge claude-codex-mcp-bridge setup
+npx --yes --package=github:WebisityStudio/claude-codex-mcp-bridge claude-codex-mcp-bridge doctor
+npx --yes --package=github:WebisityStudio/claude-codex-mcp-bridge claude-codex-mcp-bridge demo
+```
+
+Open fresh Claude and Codex sessions after setup.
+
+## Everyday requests
+
+The installer adds `/ask-codex`, `/review-with-codex`, `/claude-codex-coordinator` and a `codex-teammate` Claude agent.
+
+```text
+/ask-codex implement the requested change and run the relevant tests
+/review-with-codex focus on security and regressions
+```
+
+Use the lower-level modes below only when you need visible multi-turn communication or several resumable workers.
+
+The bridge supports two advanced workflows. Pick one and use one canonical thread ID from the start.
 
 ## Mode 1: two visible chats
 

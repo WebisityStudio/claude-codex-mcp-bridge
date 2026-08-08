@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +10,7 @@ import { z } from "zod";
 import { BridgeStore } from "./bridge-store.js";
 import { waitForInbox } from "./inbox-waiter.js";
 import { Orchestrator } from "./orchestrator.js";
+import { buildAskCodexTask, buildCodexReviewTask } from "./simple-tools.js";
 
 /**
  * Resolve the shared SQLite database path. BRIDGE_DB_PATH takes precedence;
@@ -49,7 +51,7 @@ function main(): void {
   const server = new McpServer(
     {
       name: "claude-codex-bridge",
-      version: "0.1.0",
+      version: "0.2.0",
     },
     {
       instructions:
@@ -229,6 +231,59 @@ function main(): void {
       const agents = store.agents();
       return jsonResult({ count: agents.length, agents });
     },
+  );
+
+  server.registerTool(
+    "ask_codex",
+    {
+      title: "Ask Codex",
+      description:
+        "Send one bounded implementation, investigation, or verification task to a saved Codex worker. This is the simple everyday entry point; no mailbox or thread management is required.",
+      inputSchema: {
+        projectPath: z.string().min(1).describe("Absolute path to the repository or project."),
+        request: z.string().min(1).describe("What Codex should do."),
+        coordinatorAgent: z.string().min(1).optional().describe("Coordinator name. Defaults to claude-main."),
+        threadId: z.string().min(1).optional().describe("Optional stable task ID. Generated when omitted."),
+        useWorktree: z.boolean().optional().describe("Use an isolated Git worktree. Defaults true."),
+      },
+    },
+    async ({ projectPath, request, coordinatorAgent, threadId, useWorktree }) =>
+      jsonResult(
+        await orchestrator.start({
+          coordinatorAgent: coordinatorAgent ?? "claude-main",
+          projectPath,
+          task: buildAskCodexTask(request),
+          threadId: threadId ?? `ask-codex-${randomUUID()}`,
+          useWorktree: useWorktree ?? true,
+          maxRounds: 4,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "review_with_codex",
+    {
+      title: "Review with Codex",
+      description:
+        "Ask Codex for a read-only repository review with evidence and actionable findings. No mailbox setup is required and Codex is instructed not to edit files.",
+      inputSchema: {
+        projectPath: z.string().min(1).describe("Absolute path to the repository."),
+        focus: z.string().optional().describe("Optional review focus, such as security, a PR, or a subsystem."),
+        coordinatorAgent: z.string().min(1).optional().describe("Coordinator name. Defaults to claude-main."),
+        threadId: z.string().min(1).optional().describe("Optional stable task ID. Generated when omitted."),
+      },
+    },
+    async ({ projectPath, focus, coordinatorAgent, threadId }) =>
+      jsonResult(
+        await orchestrator.start({
+          coordinatorAgent: coordinatorAgent ?? "claude-main",
+          projectPath,
+          task: buildCodexReviewTask(focus),
+          threadId: threadId ?? `codex-review-${randomUUID()}`,
+          useWorktree: false,
+          maxRounds: 1,
+        }),
+      ),
   );
 
   server.registerTool(

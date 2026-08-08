@@ -55,7 +55,9 @@ test("two independent MCP clients exchange and acknowledge a message", async () 
         "bridge_send",
         "bridge_thread",
         "bridge_wait",
-      ],
+        "ask_codex",
+        "review_with_codex",
+      ].sort(),
     );
 
     await claude.callTool({

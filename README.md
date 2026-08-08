@@ -11,6 +11,10 @@
 [![CI](https://github.com/WebisityStudio/claude-codex-mcp-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/WebisityStudio/claude-codex-mcp-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+<p align="center">
+  <img src="assets/bridge-demo.gif" alt="Claude Codex MCP Bridge send, wait, wake and acknowledge demo" width="900">
+</p>
+
 A local MCP bridge for Claude Code and OpenAI Codex. It combines a durable SQLite mailbox with a bounded orchestration loop that can start and resume saved Codex workers.
 
 ```text
@@ -58,6 +62,8 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 | `bridge_ack` | Acknowledge handled messages without deleting history |
 | `bridge_thread` | Read a complete thread |
 | `bridge_agents` | List registered agents |
+| `ask_codex` | Handle a normal implementation, investigation or verification request without mailbox setup |
+| `review_with_codex` | Run an evidence-led, read-only Codex repository review |
 | `bridge_orchestrate_codex` | Start a saved Codex worker, optionally in a worktree |
 | `bridge_continue_codex` | Resume the same Codex session with Claude's answer |
 | `bridge_orchestration_status` | Read durable run state and audit events |
@@ -75,45 +81,70 @@ Core tests run on macOS, Linux and Windows in GitHub Actions. The live Claude De
 
 ## Install
 
+### One command
+
+Run directly from the public GitHub repository:
+
+```bash
+npx --yes --package=github:WebisityStudio/claude-codex-mcp-bridge claude-codex-mcp-bridge setup
+```
+
+The setup command:
+
+- builds the package automatically;
+- detects and registers Claude Code and Codex;
+- resolves the server's absolute path internally;
+- installs the `ask-codex`, `review-with-codex` and coordinator skills;
+- installs a Claude `codex-teammate` agent definition;
+- points both clients at the same local database.
+
+Open fresh Claude and Codex sessions after setup, then verify the bridge:
+
+```bash
+npx --yes --package=github:WebisityStudio/claude-codex-mcp-bridge claude-codex-mcp-bridge doctor
+npx --yes --package=github:WebisityStudio/claude-codex-mcp-bridge claude-codex-mcp-bridge demo
+```
+
+Other commands:
+
+```bash
+claude-codex-mcp-bridge status
+claude-codex-mcp-bridge setup --force
+claude-codex-mcp-bridge uninstall
+claude-codex-mcp-bridge uninstall --purge
+```
+
+`uninstall` keeps the SQLite history unless `--purge` is explicitly supplied.
+
+### Manual fallback
+
 ```bash
 git clone https://github.com/WebisityStudio/claude-codex-mcp-bridge.git
 cd claude-codex-mcp-bridge
 npm ci
 npm run check
-```
-
-Build output is written to `dist/`:
-
-```bash
-npm run build
-```
-
-Use the absolute path to `dist/server.js` in both clients.
-
-### Claude Code
-
-```bash
-claude mcp add --scope user claude-codex-bridge -- node /absolute/path/to/claude-codex-mcp-bridge/dist/server.js
-```
-
-### Codex
-
-```bash
-codex mcp add claude-codex-bridge -- node /absolute/path/to/claude-codex-mcp-bridge/dist/server.js
-```
-
-Restart or open a fresh session in each client after changing MCP configuration.
-
-### Windows
-
-Use a quoted Windows path:
-
-```powershell
-claude mcp add --scope user claude-codex-bridge -- node "C:\path\to\claude-codex-mcp-bridge\dist\server.js"
-codex mcp add claude-codex-bridge -- node "C:\path\to\claude-codex-mcp-bridge\dist\server.js"
+node dist/cli.js setup
 ```
 
 If Codex is not available as `codex` on `PATH`, set `CODEX_BIN` in the MCP server environment to the full executable path.
+
+## Everyday use
+
+After opening a fresh Claude session:
+
+```text
+/ask-codex investigate why the authentication tests are flaky
+/review-with-codex focus on authentication and tenant isolation
+```
+
+Or simply ask Claude:
+
+```text
+Ask Codex to implement this change and verify it.
+Have Codex review this repository for security regressions.
+```
+
+The installed skills route these requests through `ask_codex` and `review_with_codex`. Users do not need to choose agent names, create mailbox threads or manage acknowledgements for ordinary one-shot work.
 
 ## Quick start: two visible chats
 

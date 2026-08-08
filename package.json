@@ -1,7 +1,6 @@
 {
   "name": "claude-codex-mcp-bridge",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
   "type": "module",
   "description": "Local MCP mailbox and bounded orchestration bridge for Claude Code and OpenAI Codex.",
   "license": "MIT",
@@ -21,13 +20,27 @@
     "orchestration",
     "sqlite"
   ],
+  "files": [
+    "dist/",
+    "skills/",
+    "agents/",
+    "assets/",
+    "docs/",
+    "README.md",
+    "INSTRUCTIONS.md",
+    "LICENSE"
+  ],
   "bin": {
-    "claude-codex-mcp-bridge": "dist/server.js"
+    "claude-codex-mcp-bridge": "dist/cli.js",
+    "claude-codex-mcp-server": "dist/server.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "test": "node --import tsx --test test/*.test.ts",
-    "check": "npm run test && npm run build",
+    "check": "npm run build && npm run test",
+    "prepare": "npm run build",
+    "prepack": "npm run check",
     "smoke:orchestrator": "npm run build && node --import tsx scripts/smoke-orchestrator.ts"
   },
   "dependencies": {
@@ -41,5 +54,8 @@
   },
   "engines": {
     "node": ">=22.5.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
