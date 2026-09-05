@@ -55,6 +55,8 @@ test("two independent MCP clients exchange and acknowledge a message", async () 
         "bridge_send",
         "bridge_thread",
         "bridge_wait",
+        "bridge_sessions",
+        "bridge_wake_status",
         "ask_codex",
         "review_with_codex",
       ].sort(),

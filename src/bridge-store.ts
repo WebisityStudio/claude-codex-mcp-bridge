@@ -1,3 +1,4 @@
+import { WakeQueue } from "./wake-queue.js";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -66,6 +67,7 @@ export interface RunEvent {
 }
 
 export interface SendInput {
+  wake?: boolean;
   fromAgent: string;
   toAgent: string;
   body: string;
@@ -128,6 +130,7 @@ interface RunEventRow {
  */
 export class BridgeStore {
   private readonly db: DatabaseSync;
+  readonly wakes: WakeQueue;
 
   constructor(dbPath: string) {
     if (dbPath !== ":memory:") {
@@ -136,7 +139,9 @@ export class BridgeStore {
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     this.migrate();
+    this.wakes = new WakeQueue(this.db, dbPath);
   }
 
   private migrate(): void {
@@ -223,6 +228,18 @@ export class BridgeStore {
    * is returned instead of creating a duplicate.
    */
   send(input: SendInput): BridgeMessage {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const message = this.insertMessage(input);
+      this.db.exec("COMMIT");
+      return message;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private insertMessage(input: SendInput): BridgeMessage {
     const threadId = input.threadId ?? null;
     const idempotencyKey = input.idempotencyKey ?? null;
 
@@ -257,7 +274,9 @@ export class BridgeStore {
     const row = this.db
       .prepare("SELECT * FROM messages WHERE id = ?")
       .get(Number(result.lastInsertRowid)) as unknown as MessageRow;
-    return this.toMessage(row);
+    const message = this.toMessage(row);
+    if (input.wake !== false) this.wakes.enqueue(message);
+    return message;
   }
 
   /**

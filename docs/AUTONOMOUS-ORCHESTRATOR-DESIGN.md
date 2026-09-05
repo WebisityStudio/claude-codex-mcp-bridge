@@ -6,7 +6,7 @@ Let a Claude Code session running Fable 5 coordinate one or more Codex workers w
 
 ## Critical runtime fact
 
-MCP mailboxes cannot wake an idle desktop chat. The reliable pattern is therefore a long-lived Claude tool loop:
+This document describes the original saved-worker mode. Version 0.3 also offers [native background pings](BACKGROUND-WAKE.md) for existing app conversations. A mailbox write alone still does not start a model turn. The saved-worker pattern uses an active Claude tool loop:
 
 ```text
 User gives task to active Claude/Fable session
@@ -19,7 +19,7 @@ User gives task to active Claude/Fable session
   → final report returns to Claude
 ```
 
-Standalone Claude CLI subscription access currently returns HTTP 403 on this Mac, while the Claude desktop Code session has Fable 5 access. The orchestrator must not attempt to launch a separate Fable CLI. It deliberately routes hard questions back through the active Fable coordinator.
+At the original August 2026 investigation, standalone Claude CLI subscription access returned HTTP 403 on the development Mac, while the Claude desktop Code session has Fable 5 access. The orchestrator must not attempt to launch a separate Fable CLI. It deliberately routes hard questions back through the active Fable coordinator.
 
 ## What appears in the apps
 

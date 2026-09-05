@@ -29,10 +29,11 @@ The default mode has no account, cloud relay, HTTP server or listening network p
 
 Plain MCP tools are request-response. Writing a message to a mailbox does not automatically start a new model turn in another GUI chat.
 
-This project supports two practical patterns:
+This project supports three practical patterns:
 
-1. **Two visible chats:** both agents use `bridge_wait` before going idle. A pending MCP call returns when the matching message arrives.
-2. **Claude coordinates Codex:** Claude calls `bridge_orchestrate_codex`; the bridge starts a saved Codex CLI session, waits for structured output and can resume that exact session after a Fable decision.
+1. **Background pings (experimental macOS):** bind the exact app sessions; a durable message wakes an idle recipient through its native local inbox. See [background setup and limits](docs/BACKGROUND-WAKE.md).
+2. **Active waits:** both agents use `bridge_wait` before going idle. A pending MCP call returns when the matching message arrives.
+3. **Claude coordinates Codex:** Claude calls `bridge_orchestrate_codex`; the bridge starts a saved Codex CLI session, waits for structured output and can resume that exact session after a Fable decision.
 
 See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 
@@ -43,6 +44,7 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 - Stable thread IDs
 - Recipient-scoped acknowledgements
 - Idempotency keys
+- Optional native background pings, exact conversation bindings and durable delivery status
 - Blocking waits with sender/thread filters
 - Durable Codex run state and audit events
 - Saved Codex session continuation
@@ -55,8 +57,10 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 
 | Tool | Purpose |
 |---|---|
-| `bridge_register` | Register an agent name and capabilities |
-| `bridge_send` | Send a direct or broadcast message |
+| `bridge_register` | Register an agent, optionally binding its exact app session for background pings |
+| `bridge_send` | Save a message and ping a bound direct recipient |
+| `bridge_sessions` | Discover live local Claude sessions and available Codex identity |
+| `bridge_wake_status` | Inspect durable ping outcomes separately from acknowledgements |
 | `bridge_inbox` | Read unread messages immediately |
 | `bridge_wait` | Keep the current turn open until a matching message arrives |
 | `bridge_ack` | Acknowledge handled messages without deleting history |
@@ -146,7 +150,11 @@ Have Codex review this repository for security regressions.
 
 The installed skills route these requests through `ask_codex` and `review_with_codex`. Users do not need to choose agent names, create mailbox threads or manage acknowledgements for ordinary one-shot work.
 
-## Quick start: two visible chats
+## Quick start: background pings
+
+Use [the background wake guide](docs/BACKGROUND-WAKE.md) to register each existing conversation with its exact session ID. Send messages normally, acknowledge after handling, and end the turn when no work remains. The MCP process delivers pings while the models are idle. Both local app session hosts must remain available.
+
+## Fallback: active waits
 
 Pick one canonical thread ID, for example `invoice-review-001`. Register unique names, send with `bridge_send`, and wait with:
 
@@ -201,7 +209,9 @@ All MCP processes must point to the same database.
 
 ## Honest limitations
 
-- MCP cannot cold-wake a GUI chat after its model turn has ended. `bridge_wait` works by keeping the current call alive.
+- Background wake adapters use experimental local app interfaces. They can start an idle model turn, but require the app and session host to remain running.
+- Peer-message and tool approvals remain under the recipient app's normal policy. Ambiguous submissions are not automatically replayed.
+- Unbound recipients still require an active `bridge_wait` or an explicit inbox read.
 - Agent registration does not prove active processing.
 - A mismatched thread filter can leave valid messages unread.
 - Codex session persistence does not guarantee immediate appearance in every desktop app version's thread list.
@@ -209,10 +219,10 @@ All MCP processes must point to the same database.
 
 ## Safety
 
-- No credentials are stored by this project.
+- No credentials are stored by this project. The Claude wake adapter reads only the addressed inbox's existing local peer token into memory and never logs it.
 - Child processes receive a small allowlist of environment variables, not the full parent environment.
 - Messages are local but are stored unencrypted in SQLite.
-- Do not send secrets through the mailbox unless every connected client is trusted.
+- Do not send secrets through the mailbox.
 - Worker prompts prohibit commits, pushes, deployments, external sends, credential changes, deletion and production mutations unless separately approved.
 
 ## Development
@@ -224,7 +234,9 @@ npm run check
 npm audit --omit=dev --audit-level=high
 ```
 
-The test suite covers mailbox routing, acknowledgements, idempotency, independent MCP processes, blocking waits, durable orchestration state, session continuation, loop limits and platform-safe process environments.
+If active MCP clients load this checkout's `dist/server.js`, use `npm run check:wake` during isolated wake experiments. It builds into `dist-wake/` and leaves the active compiled runtime in place. The ordinary build and packaging commands still produce `dist/`.
+
+The test suite covers native socket framing, identity and permission boundaries, wake persistence and crash recovery, mailbox routing, acknowledgements, idempotency, independent MCP processes, blocking waits, durable orchestration state, session continuation, loop limits and platform-safe process environments.
 
 ## Related work
 

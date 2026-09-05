@@ -7,6 +7,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { claudeSessions } from "./claude-wake.js";
+import { WakeDispatcher } from "./wake-dispatcher.js";
 import { BridgeStore } from "./bridge-store.js";
 import { waitForInbox } from "./inbox-waiter.js";
 import { Orchestrator } from "./orchestrator.js";
@@ -46,16 +48,17 @@ function main(): void {
   const dbPath = resolveDbPath();
   const store = new BridgeStore(dbPath);
   const orchestrator = new Orchestrator(store);
+  const dispatcher = new WakeDispatcher(store);
   log(`store ready at ${dbPath}`);
 
   const server = new McpServer(
     {
       name: "claude-codex-bridge",
-      version: "0.2.0",
+      version: "0.3.0",
     },
     {
       instructions:
-        "Local Claude/Fable and Codex coordination bridge. For live two-chat coordination, never end a turn and later ask the user to tell you to read messages: after bridge_send or after handling a returned message, call bridge_wait for the same agent and thread before going idle; when it returns, handle, reply, and wait again until completed, blocked, approval-required, or explicitly stopped. For autonomous implementation, the active Claude Fable coordinator calls bridge_orchestrate_codex. If it returns waiting_for_fable, answer the precise question yourself (or use a Claude chip) and immediately call bridge_continue_codex with the same runId. Repeat without asking the user unless status is blocked, failed, or completed. When Codex returns independent suggestedChips that are necessary for the user's task, automatically start up to three separate bridge_orchestrate_codex calls, each with its own thread and worktree. Never treat this bridge as permission to commit, push, deploy, publish, send externally, change credentials, delete data, or mutate production.",
+        "Local Claude/Fable and Codex coordination bridge. For background coordination, bind each unique agent name to its exact app session using bridge_register wake. bridge_send saves the message then pings bound recipients; inspect bridge_wake_status for accepted, read, held, refused, pending or unknown outcomes. End the turn when no work remains. Do not poll or use bridge_wait for bound recipients. On a ping, read your inbox, handle within existing user authorization, acknowledge after handling, and reply to fromAgent only when work is complete, blocked or needs a decision. Never create acknowledgement ping loops. Unbound agents can use bridge_wait while an active turn needs a bounded wait. For autonomous implementation, the active Claude Fable coordinator calls bridge_orchestrate_codex. If it returns waiting_for_fable, answer the precise question yourself (or use a Claude chip) and immediately call bridge_continue_codex with the same runId. Repeat without asking the user unless status is blocked, failed, or completed. When Codex returns independent suggestedChips that are necessary for the user's task, automatically start up to three separate bridge_orchestrate_codex calls, each with its own thread and worktree. Never treat this bridge as permission to commit, push, deploy, publish, send externally, change credentials, delete data, or mutate production.",
     },
   );
 
@@ -67,15 +70,17 @@ function main(): void {
         "Announce an agent and its capabilities so others can discover it.",
       inputSchema: {
         agent: z.string().min(1).describe("Unique agent name, e.g. 'claude'."),
+        wake: z.object({ app: z.enum(["codex", "claude"]), sessionId: z.string().min(1).max(128) }).nullable().optional().describe("Opt in to background pings for this exact app session. null disables pings; omitted preserves the binding. Discover Claude IDs with bridge_sessions; use the Codex task ID."),
         capabilities: z
           .array(z.string())
           .optional()
           .describe("Skills this agent offers, e.g. ['review','architecture']."),
       },
     },
-    async ({ agent, capabilities }) => {
+    async ({ agent, capabilities, wake }) => {
+      if (wake !== undefined) store.wakes.bind(agent, wake);
       const registered = store.register(agent, capabilities ?? []);
-      return jsonResult(registered);
+      return jsonResult({ ...registered, wake: store.wakes.target(agent) });
     },
   );
 
@@ -84,8 +89,9 @@ function main(): void {
     {
       title: "Send a message",
       description:
-        "Deliver a message to another agent. Use '*' to broadcast to everyone.",
+        "Save a message, then ping its bound recipient in the background. Use wake:false for quiet updates. Broadcasts do not wake agents. Inspect wake status separately from acknowledgement.",
       inputSchema: {
+        wake: z.boolean().optional().describe("Ping a bound direct recipient. Defaults true. False saves silently."),
         from: z.string().min(1).describe("Sender agent name."),
         to: z
           .string()
@@ -102,17 +108,36 @@ function main(): void {
           .describe("Optional key to prevent duplicate delivery on retry."),
       },
     },
-    async ({ from, to, body, threadId, idempotencyKey }) => {
+    async ({ from, to, body, threadId, idempotencyKey, wake }) => {
       const message = store.send({
+        wake,
         fromAgent: from,
         toAgent: to,
         body,
         threadId: threadId ?? null,
         idempotencyKey: idempotencyKey ?? null,
       });
-      return jsonResult(message);
+      await dispatcher.flush();
+      return jsonResult({ ...message, wake: store.wakes.forMessage(message.id) });
     },
   );
+
+  server.registerTool("bridge_sessions", {
+    title: "Discover local wake targets",
+    description: "Read live Claude session IDs and this MCP process's Codex task ID when available. Does not wake anything or read conversation content.",
+    inputSchema: {},
+  }, async () => jsonResult({
+    mailboxPath: dbPath,
+    claude: await claudeSessions(),
+    codexSessionId: process.env.CODEX_THREAD_ID ?? null,
+    note: "Use the exact Codex task ID from the app when it is not inherited here. Background adapters are experimental macOS local interfaces.",
+  }));
+
+  server.registerTool("bridge_wake_status", {
+    title: "Inspect background ping delivery",
+    description: "Read up to 100 recent wake receipts. Accepted means the app accepted a ping, not that the work is complete. Held/refused respect app permission checks; unknown outcomes are never replayed automatically.",
+    inputSchema: { agent: z.string().min(1).optional() },
+  }, async ({ agent }) => jsonResult({ jobs: store.wakes.list(agent) }));
 
   server.registerTool(
     "bridge_inbox",
@@ -132,6 +157,7 @@ function main(): void {
       const messages = store.inbox(agent, {
         includeAcknowledged: includeAcknowledged ?? false,
       });
+      store.wakes.recordRead(agent, messages.map(message => message.id));
       return jsonResult({ count: messages.length, messages });
     },
   );
@@ -228,7 +254,7 @@ function main(): void {
       inputSchema: {},
     },
     async () => {
-      const agents = store.agents();
+      const agents = store.agents().map(agent => ({ ...agent, wake: store.wakes.target(agent.name) }));
       return jsonResult({ count: agents.length, agents });
     },
   );
@@ -349,21 +375,21 @@ function main(): void {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`received ${signal}, shutting down`);
-    void server.close().finally(() => {
+    void dispatcher.close().then(() => server.close()).finally(() => {
       store.close();
       process.exit(0);
     });
   };
+  server.server.onclose = () => shutdown("transport closed");
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   server
     .connect(transport)
-    .then(() => log("connected over stdio"))
+    .then(() => { dispatcher.start(); log("connected over stdio"); })
     .catch((error: unknown) => {
       log(`fatal: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
-      store.close();
-      process.exit(1);
+      void dispatcher.close().finally(() => { store.close(); process.exit(1); });
     });
 }
 

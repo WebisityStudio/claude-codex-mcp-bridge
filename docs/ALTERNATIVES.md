@@ -18,7 +18,8 @@ Checked on 8 August 2026:
 - No account, HTTP service or listening network port in the default mode
 - One local SQLite WAL store shared by independent stdio MCP processes
 - Durable threads, recipient-scoped acknowledgements and idempotent sends
-- A blocking `bridge_wait` tool for active two-chat coordination
+- Optional native macOS background pings for existing app conversations (added September 2026)
+- A blocking `bridge_wait` fallback for active two-chat coordination
 - Saved Codex CLI sessions that can be resumed after a Fable decision
 - Optional isolated Git worktrees for implementation workers
 - Round limits, audit events and explicit approval boundaries

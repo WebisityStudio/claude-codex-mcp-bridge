@@ -15,3 +15,6 @@ coverage/
 Thumbs.db
 .local/
 runs/
+
+# Local experimental build; active MCP uses dist/.
+dist-wake/

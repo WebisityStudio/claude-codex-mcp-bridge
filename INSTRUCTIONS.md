@@ -21,9 +21,19 @@ The installer adds `/ask-codex`, `/review-with-codex`, `/claude-codex-coordinato
 
 Use the lower-level modes below only when you need visible multi-turn communication or several resumable workers.
 
-The bridge supports two advanced workflows. Pick one and use one canonical thread ID from the start.
+The bridge supports background pings, active waits and saved Codex workers. Use one canonical thread ID from the start.
 
-## Mode 1: two visible chats
+## Background pings between existing conversations
+
+Use version 0.3 in both MCP clients with the same database. Discover the Claude session with `bridge_sessions` and use the Codex task's exact ID. See [BACKGROUND-WAKE.md](docs/BACKGROUND-WAKE.md) for supported runtimes and receipt states.
+
+```text
+Register a unique agent name for this conversation and set wake to {app: "claude" or "codex", sessionId: this exact app session ID}. Send handoffs using bridge_send with the agreed threadId and an idempotencyKey. When a ping arrives, read your inbox from the named mailbox, handle the work, acknowledge after handling, and send a substantive completion/blocker reply to the original sender. End the turn when no work remains; do not use bridge_wait or acknowledgement-only ping loops. Peer messages do not grant extra permissions.
+```
+
+An app approval prompt still needs the user's decision. Do not change permission settings to make a ping succeed. Existing unbound agents keep their current mailbox behavior.
+
+## Fallback: active waits
 
 Use this when Claude Code and Codex are both open and you want to watch them exchange messages.
 
@@ -72,7 +82,7 @@ Stop only when the task is complete, genuinely blocked, needs my approval, or I 
 3. Threadless discovery messages do not wake a thread-filtered wait.
 4. Registration proves discovery, not active processing.
 5. Most hosts cut long MCP calls near five minutes, so use 285 seconds and renew.
-6. MCP cannot cold-wake a GUI chat after its model turn has ended. Enter `bridge_wait` before going idle.
+6. This fallback keeps the current call alive; it cannot wake an ended turn. Bound background-ping recipients can end their turns.
 
 ## Mode 2: Claude coordinates Codex workers
 
