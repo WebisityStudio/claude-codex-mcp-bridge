@@ -10,6 +10,7 @@ Driven by field use of the 0.3 mailbox with dozens of agents: Claude pings that 
 - `review_with_codex` runs in a read-only sandbox instead of relying on its prompt, and warns if the workspace changed.
 - The mailbox, its WAL/SHM files, backups and Codex turn files are owner-only (`0600`/`0700`). Existing files are tightened at startup, and `doctor --fix` fixes them on demand.
 - `BRIDGE_CODEX_CONFIG` can tune worker model settings. It can never change sandbox, approval or environment policy.
+- Dependencies updated past published advisories in `fast-uri` (high) and `qs` (moderate), both pulled in by the MCP SDK.
 
 ### Delivery
 
@@ -47,3 +48,18 @@ Driven by field use of the 0.3 mailbox with dozens of agents: Claude pings that 
 - `demo` retires its two demo agents when it finishes.
 - Atomic builds: `dist/` is swapped in whole, never deleted first.
 - Type checking now covers tests and scripts. The live smoke test runs fully isolated.
+
+## 0.3.0
+
+- Experimental background pings between existing Claude and Codex conversations on macOS: `bridge_register` binds an agent to an exact app session, and `bridge_send` pings a bound recipient through its app's local interface.
+- Durable wake jobs committed with the message, idempotent sends that never ping twice, and `bridge_wake_status` receipts that keep delivery separate from acknowledgement.
+- `bridge_sessions` discovers live Claude sessions. Quiet sends (`wake: false`), broadcasts and self-messages never ping.
+- An explicit-database MCP client for isolated wake testing.
+
+## 0.2.0
+
+- One-command setup from GitHub with automatic Claude and Codex MCP registration.
+- A stable per-user runtime installation, with no pasted absolute paths.
+- `doctor`, `status`, `demo` and safe `uninstall` commands.
+- `ask_codex` and read-only `review_with_codex` MCP tools.
+- Three user-invocable skills plus a Codex teammate definition.
