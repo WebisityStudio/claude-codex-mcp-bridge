@@ -87,3 +87,20 @@ test("agents can register presence and report capabilities", () => {
   assert.deepEqual(agents[0]?.capabilities, ["architecture", "review"]);
   store.close();
 });
+
+test("broadcasts reach agents registered when they were sent, not late joiners", async () => {
+  const store = freshStore();
+  store.register("early");
+  const old = store.send({ fromAgent: "lead", toAgent: "*", body: "Old announcement" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  store.register("late");
+  store.send({ fromAgent: "lead", toAgent: "*", body: "New announcement" });
+
+  assert.deepEqual(store.inbox("early").map((message) => message.body), ["Old announcement", "New announcement"]);
+  assert.deepEqual(store.inbox("late").map((message) => message.body), ["New announcement"]);
+  assert.equal(store.countUnread("late"), 1);
+  assert.equal(store.ack("late", [old.id]), 0, "an undelivered broadcast cannot be acknowledged");
+  // Readers that never registered keep seeing every broadcast.
+  assert.equal(store.inbox("unregistered-reader").length, 2);
+  store.close();
+});

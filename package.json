@@ -1,8 +1,8 @@
 {
   "name": "claude-codex-mcp-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Local MCP mailbox and bounded orchestration bridge for Claude Code and OpenAI Codex.",
+  "description": "Local MCP mailbox, background pings and sandboxed Codex workers for Claude Code and OpenAI Codex.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -28,6 +28,7 @@
     "docs/",
     "README.md",
     "INSTRUCTIONS.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "bin": {
@@ -36,14 +37,13 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
     "test": "node --import tsx --test test/*.test.ts",
-    "check": "npm run build && npm run test",
+    "check": "npm run typecheck && npm run build && npm run test",
     "prepare": "npm run build",
     "prepack": "npm run check",
-    "smoke:orchestrator": "npm run build && node --import tsx scripts/smoke-orchestrator.ts",
-    "build:wake": "tsc -p tsconfig.json --outDir dist-wake",
-    "check:wake": "npm run build:wake && npm run test"
+    "smoke:orchestrator": "node --import tsx scripts/smoke-orchestrator.ts",
+    "typecheck": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

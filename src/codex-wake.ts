@@ -32,7 +32,7 @@ export async function wakeCodex(job: WakeJob,
     const owner = await ipc.request("thread-owner-discovery",
       { hostId: "local", conversationId: job.target.sessionId }, 1);
     if (owner.resultType !== "success" || !owner.handledByClientId) {
-      return { state: "pending", detail: "Codex task has no connected owner" };
+      return { state: "pending", detail: "Codex task has no connected owner", reason: "offline" };
     }
     if (owner.result?.supportsUntrustedAppInput !== true) {
       return { state: "refused", detail: "Codex owner does not support peer content; update the app" };
@@ -47,12 +47,12 @@ export async function wakeCodex(job: WakeJob,
     }
     // This exact native guard runs before context injection or turn creation.
     if (reply.error === "App context must wait until the current turn finishes") {
-      return { state: "pending", detail: "Codex is working; ping will wait for idle" };
+      return { state: "pending", detail: "Codex is working; ping will wait for idle", reason: "busy" };
     }
     return { state: "unknown", detail: "Codex did not confirm the turn; check the task before retrying" };
   } catch {
     return submitted
       ? { state: "unknown", detail: "Codex delivery outcome unavailable; no automatic replay" }
-      : { state: "pending", detail: "Codex local connection unavailable" };
+      : { state: "pending", detail: "Codex local connection unavailable", reason: "offline" };
   } finally { ipc.close(); }
 }

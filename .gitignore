@@ -16,5 +16,7 @@ Thumbs.db
 .local/
 runs/
 
-# Local experimental build; active MCP uses dist/.
+# Staging directories used by the atomic build, plus the retired 0.3 experiment build.
+dist.next/
+dist.old/
 dist-wake/

@@ -6,19 +6,13 @@ export interface WaitForInboxInput {
   threadId?: string;
   timeoutMs: number;
   pollIntervalMs?: number;
+  /** Upper bound on messages returned by one wake-up. */
+  limit?: number;
 }
 
 export interface WaitForInboxResult {
   timedOut: boolean;
   messages: BridgeMessage[];
-}
-
-function matchingMessages(store: BridgeStore, input: WaitForInboxInput): BridgeMessage[] {
-  return store.inbox(input.agent).filter((message) => {
-    if (input.fromAgent && message.fromAgent !== input.fromAgent) return false;
-    if (input.threadId && message.threadId !== input.threadId) return false;
-    return true;
-  });
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -33,7 +27,12 @@ export async function waitForInbox(
   const deadline = Date.now() + input.timeoutMs;
 
   while (true) {
-    const messages = matchingMessages(store, input);
+    // Filters run in SQL so a large unread backlog is not re-read on every poll.
+    const messages = store.inbox(input.agent, {
+      fromAgent: input.fromAgent,
+      threadId: input.threadId,
+      limit: input.limit ?? 100,
+    });
     if (messages.length > 0) return { timedOut: false, messages };
 
     const remainingMs = deadline - Date.now();

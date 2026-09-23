@@ -1,67 +1,57 @@
-# Autonomous Claude/Fable ↔ Codex orchestration
+# Autonomous Claude ↔ Codex orchestration
 
 ## Goal
 
-Let a Claude Code session running Fable 5 coordinate one or more Codex workers without the user manually copying messages. Claude starts a Codex run through MCP, Codex works in an isolated worktree, and the tool returns the report to the same Claude turn. If Codex needs stronger reasoning, it returns a structured Fable question. The already-active Fable 5 coordinator answers and calls the continuation tool, so the exchange continues without user intervention.
+Let a Claude Code session coordinate one or more Codex workers without the user copying messages. Claude starts a Codex run through MCP, Codex works in an isolated worktree, and the result comes back to Claude either in the same tool call or, for longer work, as a mailbox message. If Codex needs a decision, it returns a structured question; the coordinator answers and the same Codex session resumes.
 
-## Critical runtime fact
-
-This document describes the original saved-worker mode. Version 0.3 also offers [native background pings](BACKGROUND-WAKE.md) for existing app conversations. A mailbox write alone still does not start a model turn. The saved-worker pattern uses an active Claude tool loop:
+## Flow
 
 ```text
-User gives task to active Claude/Fable session
-  → Claude calls bridge_orchestrate_codex
-  → bridge starts/resumes a saved Codex CLI session
-  → Codex completes OR asks Fable for help
-  → tool result returns to the same Claude turn
-  → Fable answers and calls bridge_continue_codex
-  → Codex resumes with the answer
-  → final report returns to Claude
+User gives a task to an active Claude session
+  → Claude calls ask_codex / review_with_codex / bridge_orchestrate_codex
+  → bridge prepares the workspace and starts a detached Codex CLI turn
+  → the call waits up to waitSeconds (default 240)
+      finished → result returned in the same call
+      still running → running_codex returned; the result is posted later to
+                      the coordinator's mailbox from "bridge" (a bound
+                      coordinator is pinged), or fetched with
+                      bridge_orchestration_wait
+  → waiting_for_fable → Claude answers → bridge_continue_codex
+  → Codex resumes the same session, sandbox and worktree
+  → completed / blocked / failed
 ```
 
-At the original August 2026 investigation, standalone Claude CLI subscription access returned HTTP 403 on the development Mac, while the Claude desktop Code session has Fable 5 access. The orchestrator must not attempt to launch a separate Fable CLI. It deliberately routes hard questions back through the active Fable coordinator.
+Only one path hands a round's result over. The waiter and the background delivery both claim it atomically in SQLite, so the coordinator never receives the same round twice by accident. An explicit `bridge_orchestration_wait` after delivery still returns the result and says it was already posted.
 
-## What appears in the apps
+## Sandbox
 
-- The original Claude Code conversation remains the coordinator and displays MCP tool calls/results.
-- Codex runs use the official bundled Codex CLI and persist real Codex session IDs. They are stored under the same Codex host, but immediate visual appearance in the desktop thread list is host-version dependent and is not guaranteed.
-- The orchestrator never injects input into, kills, restarts, or hijacks an already-running Claude or Codex GUI process.
+The sandbox is pinned on every turn with `-c sandbox_mode=...`, plus `--sandbox` on the first turn. `codex exec resume` has no `--sandbox` flag, and before 0.4 resumed turns silently fell back to the user's `config.toml` default. On the development machine that default was `danger-full-access`, so a resumed worker had no sandbox at all. A live smoke test now confirms from Codex's own session log that every turn runs `workspace-write`.
 
-## MCP tools
+- Implementation runs: `workspace-write`, network access off.
+- Reviews: `read-only`, in the live checkout. The bridge compares `git status` before and after, and warns if anything changed.
+- `BRIDGE_CODEX_CONFIG` may tune the model or effort for workers. Keys that carry the safety boundary (`sandbox_mode`, `approval_policy`, `sandbox_workspace_write.*`, `sandbox_permissions`, `shell_environment_policy`) are dropped, and the pinned values come last.
 
-### `bridge_orchestrate_codex`
+## Workspace
 
-Input:
+- Worktrees are created under `~/.local/share/claude-codex-bridge/worktrees/<repo>-<hash>/<thread>-<run>` (or `BRIDGE_WORKTREE_ROOT`), outside the repository. Tools that scan the repository (Metro, `tsc`, Jest, ESLint, `git status`) never see them.
+- A worktree starts from `HEAD`. If the main checkout has uncommitted changes, the run records a warning and tells Codex. With `includeUncommitted: true`, the bridge applies `git diff --binary HEAD` and copies untracked, non-ignored files into the worktree.
+- A project path inside a repository maps to the same subdirectory inside the worktree.
+- Every result carries `observedChanges`: the bridge's own `git status` of the workspace, alongside what Codex reports in `filesChanged`.
+- Worktrees are never cleaned automatically.
 
-```json
-{
-  "coordinatorAgent": "claude-main",
-  "projectPath": "/absolute/git/repo",
-  "task": "bounded implementation task",
-  "threadId": "invoice-fix",
-  "useWorktree": true,
-  "maxRounds": 6
-}
-```
+## Durability and recovery
 
-Returns one of:
-
-- `completed`: final report, files, tests, Codex session ID, worktree path.
-- `waiting_for_fable`: exact question plus run ID. Fable should answer and call `bridge_continue_codex`.
-- `blocked`: action requires user approval or cannot be completed safely.
-- `failed`: adapter/runtime failure with recovery detail.
-
-### `bridge_continue_codex`
-
-Input: `runId` and Fable's answer. Resumes the same Codex session and worktree.
-
-### `bridge_orchestration_status`
-
-Returns durable run state and event history after a process/app restart.
+- Codex turns run as detached process groups whose output goes to files under `runs/`: the JSONL event stream, stderr and the final envelope.
+- The Codex session ID is persisted as soon as it appears in the event stream, not only at the end.
+- Each run records its owning bridge process (PID and start time) and the Codex child (PID and start time), so a reused PID is never mistaken for the original process.
+- Every bridge process runs a reconciler every 15 seconds. A run whose owner has exited is adopted atomically. If Codex is still working, the new owner watches it; once it exits, the run is finished from its files. With no output, the run is marked failed as interrupted, with the worktree preserved. Either way the result is delivered.
+- A turn that exceeds `BRIDGE_CODEX_TURN_TIMEOUT_MINUTES` (default 20) has its process group stopped and is marked failed. It is never retried silently, because a retry could duplicate edits.
+- Round-limit exhaustion becomes `blocked`, not an infinite loop.
+- Event streams and stderr logs older than 30 days are pruned by the daily housekeeping pass. Final result envelopes are kept.
 
 ## Codex response contract
 
-Every Codex turn must return JSON matching:
+Every turn returns JSON matching:
 
 ```json
 {
@@ -77,45 +67,25 @@ Every Codex turn must return JSON matching:
 }
 ```
 
-When `suggestedChips` are returned, Claude may issue up to three independent `bridge_orchestrate_codex` calls. Each call creates a separate Codex session and worktree. This matches the old chip workflow without forcing unsafe automatic merging.
+When `suggestedChips` are returned, Claude may start up to three independent runs, each with its own session, branch and worktree. Nothing is merged automatically.
 
 ## State machine
 
 ```text
-created
-  → running_codex
-  → waiting_for_fable → running_codex (bounded loop)
-  → completed
-  → blocked
-  → failed
-  → cancelled
+created → running_codex → waiting_for_fable → running_codex (bounded loop)
+                        → completed | blocked | failed
 ```
 
-State and events are persisted in the existing SQLite database. Every run records task, project, worktree, Codex session ID, round count, status, summaries, and timestamps. Secrets and raw environment values are never written.
+State and events live in the shared SQLite database: task, project, worktree, branch, base commit, sandbox, Codex session ID, rounds, owner and child processes, turn files, status, summaries, observed changes and warnings. Secrets and raw environment values are never written.
 
-## Isolation and safety
+## Safety
 
-- Default to a git worktree under `<repo>/.bridge-worktrees/<slug>-<run-id>`.
-- Create a local branch only. Never commit, push, merge, deploy, publish, send messages, change credentials, delete files, or perform production mutations.
-- If the requested task needs any prohibited action, Codex returns `blocked` and Claude asks the user.
-- Maximum 3 parallel chips, recursion depth 1, 6 Fable/Codex rounds, and 20 minutes per Codex turn.
-- Preserve completed worktrees for inspection. Never auto-clean them.
-- Use argument arrays with `spawn`, never shell interpolation.
+- Worker prompts prohibit commits, pushes, merges, deployments, publishing, external messages, credential or configuration changes, deletion and production mutations. If one is needed, Codex returns `blocked` and Claude asks the user.
+- Child processes get a small environment allowlist.
+- Arguments go to `spawn` as arrays, never through a shell.
+- At most three parallel chips, recursion depth one, twelve rounds maximum (six by default).
 
-## Failure recovery
+## Verification
 
-- Codex session ID is captured from JSONL `thread.started` before parsing the final envelope.
-- If the MCP server restarts, `bridge_orchestration_status` recovers the run from SQLite and `bridge_continue_codex` resumes the recorded Codex session.
-- Invalid model output marks the run failed with the output path retained for diagnosis.
-- A timed-out Codex process is terminated and the run is marked failed. It is never silently retried because a retry could duplicate edits.
-- Round-limit exhaustion becomes `blocked`, not an infinite loop.
-
-## TDD plan
-
-1. Store tests for run creation, event persistence, updates, and recovery.
-2. Orchestrator test: Codex asks Fable, continuation resumes the same session, then completes.
-3. Guard test: continuation is rejected when run is not waiting for Fable.
-4. Guard test: maximum rounds stop the loop.
-5. Adapter parser tests for JSONL session IDs and final envelopes.
-6. MCP integration test confirms all orchestration tools are discoverable.
-7. Live read-only smoke test with Codex asking Fable a harmless architecture question, followed by continuation and completion.
+- Unit and integration tests cover the question and resume loop, rejection of out-of-state continuations, round limits, background delivery exactly once, read-only change detection, failed background turns, pinned sandbox arguments, a real detached process driven by a fake Codex binary (including timeout and recovery from files), adoption of orphaned runs, and real git worktrees with uncommitted changes.
+- `npm run smoke:orchestrator` runs the real Codex CLI end to end in a throwaway repository and mailbox, and fails if any turn in Codex's rollout ran outside `workspace-write`.
