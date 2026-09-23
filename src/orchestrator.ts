@@ -8,11 +8,10 @@ import {
   openSync,
   readFileSync,
   readSync,
-  realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import {
@@ -510,8 +509,9 @@ export class GitWorkspaceManager implements WorkspaceManager {
       }
     }
     // Keep the caller's subdirectory when projectPath points inside the repository.
-    const inside = relative(realpathSync(top), realpathSync(input.projectPath));
-    const path = inside && !inside.startsWith("..") && !isAbsolute(inside) ? join(worktreePath, inside) : worktreePath;
+    // Git reports it directly, so symlinks, case and Windows short names cannot confuse it.
+    const prefix = (await runProcess("git", ["-C", input.projectPath, "rev-parse", "--show-prefix"])).replace(/[\\/]+$/, "");
+    const path = prefix ? join(worktreePath, prefix) : worktreePath;
     return { path, branch, baseCommit, uncommitted, includedUncommitted, warnings };
   }
 
