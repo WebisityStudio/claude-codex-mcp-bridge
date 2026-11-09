@@ -18,6 +18,7 @@ async function connect(name: string, dbPath: string, extraEnv: Record<string, st
     env: {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
+      TMPDIR: process.env.TMPDIR ?? tmpdir(),
       BRIDGE_DB_PATH: dbPath,
       BRIDGE_BACKUPS: "0",
       XDG_DATA_HOME: join(dirname(dbPath), "data"),
@@ -174,6 +175,30 @@ test("wake: auto binds the conversation that hosts the bridge process", async ()
     assert.deepEqual(sessions.thisSession, { app: "claude", sessionId: "session-under-test" });
     const unbound = payload(await client.callTool({ name: "bridge_register", arguments: { agent: "auto-agent", wake: null } }));
     assert.equal(unbound.wake, null);
+  } finally {
+    await client.close();
+  }
+});
+
+
+test("MCP input limits reject oversized collections and text before mailbox writes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bridge-input-limits-"));
+  const client = await connect("input-limits", join(dir, "bridge.sqlite"));
+  try {
+    const invalidCalls = [
+      { name: "bridge_register", arguments: { agent: "limits", capabilities: Array(65).fill("read") } },
+      { name: "bridge_ack", arguments: { agent: "limits", ids: Array(1001).fill(1) } },
+      { name: "bridge_send", arguments: { from: "limits", to: "x".repeat(129), body: "hello" } },
+      { name: "bridge_send", arguments: { from: "limits", to: "limits", body: "x".repeat(1_000_001) } },
+      { name: "bridge_register", arguments: { agent: "limits", ...Object.fromEntries(Array.from({ length: 10_001 }, (_, i) => [`key${i}`, null])) } },
+    ];
+    for (const call of invalidCalls) {
+      const result = await client.callTool(call);
+      assert.equal(result.isError, true, `${call.name} should reject oversized input`);
+    }
+    assert.equal(payload(await client.callTool({ name: "bridge_register", arguments: { agent: "limits", capabilities: Array(64).fill("read") } })).name, "limits");
+    const inbox = payload(await client.callTool({ name: "bridge_inbox", arguments: { agent: "limits" } }));
+    assert.equal(inbox.count, 0);
   } finally {
     await client.close();
   }

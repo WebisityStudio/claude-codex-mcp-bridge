@@ -72,12 +72,14 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 
 ## Requirements
 
-- Node.js 22.5 or newer
+- A stable Node.js release in one of these supported lines: 22.x >=22.23.4, 24.x >=24.22.1, or 26.x >=26.12.1
 - Claude Code
 - OpenAI Codex CLI
 - Git, for worktree isolation
 
 The mailbox works anywhere Node and both MCP clients run. The Codex launcher uses `CODEX_BIN` when set, then the Codex binary bundled in the macOS ChatGPT app, then `codex` from `PATH`.
+
+These Node.js minimum versions include the [October 21, 2026 security fixes](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases). Setup and `doctor` reject older versions, prereleases and other major release lines. Later stable patches and minor releases within 22.x, 24.x and 26.x are accepted; a patched 26.12.1 installation can stay on that line.
 
 Core tests run on macOS, Linux and Windows in GitHub Actions. Background pings and the live Claude Desktop plus Codex Desktop workflow were developed and verified on macOS.
 
@@ -97,7 +99,7 @@ Setup:
 - edits only the bridge's own entry in Codex's `config.toml` (per-tool approval settings are kept, and a backup is written) and sets `tool_timeout_sec = 300` so waits are not cut at Codex's 60-second default;
 - installs the `ask-codex`, `review-with-codex` and coordinator skills plus a `codex-teammate` Claude agent.
 
-Setup keeps the Node.js binary your apps already launch the bridge with (pass `--node PATH` to choose another) and registers through the newest Claude Code bundled with the desktop app when present (`CLAUDE_BIN` overrides), so an older standalone `claude` on `PATH` never rewrites your Claude settings. Once installed, later updates only switch the `current` link; neither app's configuration changes again.
+Setup keeps the Node.js binary your apps already launch the bridge with when it meets the supported security baseline (pass `--node PATH` to choose another). If a registered runtime is too old, setup tries the other registration and then the Node.js running setup; it stops if none meets the baseline. It registers through the newest Claude Code bundled with the desktop app when present (`CLAUDE_BIN` overrides), so an older standalone `claude` on `PATH` never rewrites your Claude settings. Later updates switch the `current` link; MCP configuration changes only when registration needs repair or a different Node.js binary is selected.
 
 Open fresh Claude and Codex sessions afterwards. Running sessions keep the bridge they started with.
 
@@ -118,6 +120,13 @@ node dist/cli.js setup
 `setup` refuses to install a `dist/` that is older than `src/`. Run `npm run build` first.
 
 ## Everyday use
+
+In the **Claude desktop app → Code tab**, ask: “Start a separate local Claude session called
+Schema Review now. Have it review the migration without editing anything, then report back
+here.” The included `/desktop-coordinator` skill uses the app's native start and messaging
+tools. The worker has its own sidebar conversation; follow-ups go to that same session.
+If the app asks for approval or only offers a suggestion, the session has not started yet.
+This workflow requires the desktop session tools to be available in the lead conversation.
 
 After opening a fresh Claude session:
 
@@ -177,7 +186,7 @@ Most MCP hosts cut tool calls near five minutes, so waits are capped at 290 seco
 }
 ```
 
-- Implementation runs use the `workspace-write` sandbox with network access off. Reviews use `read-only`. The sandbox is pinned on every turn, including resumed ones, so a permissive default in your own Codex config never applies to bridge workers.
+- Implementation runs pin the `workspace-write` shell sandbox with network access off. Reviews pin `read-only`, including resumed turns. These shell settings do not revoke inherited MCP tools or their credentials: review the worker's effective Codex configuration before using untrusted inputs. Native CLI enforcement and separately configured tool permissions remain part of the boundary.
 - Worktrees live under `~/.local/share/claude-codex-bridge/worktrees/` (or `BRIDGE_WORKTREE_ROOT`). They stay out of your repository, so Metro, `tsc`, Jest and `git status` never see them.
 - Worktrees start from `HEAD`. When the main checkout has uncommitted changes, the result warns you; pass `includeUncommitted: true` to copy them in.
 - Every result includes `observedChanges`, the bridge's own `git status` of the workspace, next to what Codex reports.
@@ -186,6 +195,12 @@ Most MCP hosts cut tool calls near five minutes, so waits are capped at 290 seco
 - `BRIDGE_CODEX_CONFIG` can tune bridge workers without touching your interactive defaults, for example `model_reasoning_effort="medium"`. Sandbox and approval keys are ignored.
 
 The bridge does not commit, push, merge, deploy or clean worktrees.
+
+## Input and repository preparation limits
+
+Tool calls allow at most 10,000 aggregate object keys/array elements. Agent names are limited to 128 characters, capabilities to 64 entries of 128 characters each, acknowledgements to 1,000 IDs per call, thread IDs to 512 characters, message bodies to 1,000,000 characters, and worker task/answer text to 200,000 characters. Split larger work across calls; existing mailbox history is retained.
+
+Before launching a worker, bridge Git commands disable hooks, fsmonitor, external diff/textconv and configured clean/smudge/process filters. Repositories using Git LFS or custom checkout filters may therefore contain pointer or canonical bytes in a worktree; prepare trusted materialized files separately. Optional uncommitted copying rejects untracked symlinks and special files rather than reading through them. These checks assume repository directories and Git configuration are not being concurrently replaced by a hostile local writer; they are not a replacement for OS isolation of an untrusted local repository. Windows ACL and no-follow behavior require separate platform verification.
 
 ## Maintenance
 
@@ -246,6 +261,8 @@ BRIDGE_CODEX_CONFIG='model_reasoning_effort="low"' npm run smoke:orchestrator   
 ```
 
 The suite covers socket framing, identity and permission boundaries, migrations from 0.3 databases and compatibility with running 0.3 processes, ping persistence, crash recovery and failure notices, mailbox routing, addressing checks, retirement, paging, independent MCP processes, detached Codex turns with a fake Codex binary, orphaned run recovery, real git worktrees, Codex config edits and runtime rollback.
+
+The tracked `npm-shrinkwrap.json` records dependency versions and integrity hashes in place of `package-lock.json`. `npm ci` reads it for checkout installs, and npm includes it in the package so setup's installed runtime uses the same locked production dependency versions. Refresh this lockfile deliberately when updating dependencies.
 
 ## Related work
 

@@ -12,7 +12,7 @@ Open fresh Claude and Codex sessions after setup. If an update misbehaves, `clau
 
 ## Everyday requests
 
-The installer adds `/ask-codex`, `/review-with-codex`, `/claude-codex-coordinator` and a `codex-teammate` Claude agent.
+The installer adds `/ask-codex`, `/review-with-codex`, `/claude-codex-coordinator` and a `codex-teammate` Claude agent. For Claude-to-Claude work in the desktop Code tab, use `/desktop-coordinator` and say explicitly to **start a separate local session now**. Keep the returned session ID for follow-ups. A suggested-task card is not a running worker.
 
 ```text
 /ask-codex implement the requested change and run the relevant tests

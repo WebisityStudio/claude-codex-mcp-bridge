@@ -2,16 +2,20 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
-  copyFileSync,
+  constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   readSync,
+  realpathSync,
   statSync,
+  writeSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import {
@@ -453,6 +457,84 @@ function runProcess(
   });
 }
 
+/** Git preparation runs before the worker sandbox: never run repository helpers. */
+async function runGit(
+  cwd: string,
+  args: string[],
+  options: { input?: string; trim?: boolean } = {},
+): Promise<string> {
+  const config = [
+    "-c", `core.hooksPath=${process.platform === "win32" ? "NUL" : "/dev/null"}`,
+    "-c", "core.fsmonitor=false",
+  ];
+  // Config discovery does not run hooks or filters. Disable all configured
+  // clean/smudge/process drivers, including ones selected by .gitattributes.
+  const names = await runProcess("git", ["-C", cwd, ...config, "config", "--null", "--name-only", "--list"], { trim: false });
+  for (const key of new Set(names.split("\0"))) {
+    if (/^filter\..+\.(clean|smudge|process|required)$/.test(key)) {
+      config.push("-c", `${key}=${key.endsWith(".required") ? "false" : ""}`);
+    }
+  }
+  const command = args[0] === "diff" ? ["diff", "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
+  return runProcess("git", ["-C", cwd, ...config, ...command], options);
+}
+
+/** Reject links and special files rather than materializing host data in a worktree. */
+function untrackedPath(root: string, file: string, createParents = false): string {
+  const parts = file.split("/");
+  const target = join(root, file);
+  const offset = relative(root, target);
+  if (isAbsolute(file) || !offset || isAbsolute(offset) || offset === ".." || offset.startsWith(`..${sep}`) ||
+      parts.some((part) => !part || part === "." || part === ".." || part.toLowerCase() === ".git") ||
+      (process.platform === "win32" && /[\\:]/.test(file))) {
+    throw new Error(`Unsafe untracked path: ${JSON.stringify(file)}`);
+  }
+  let parent = root;
+  for (const part of parts.slice(0, -1)) {
+    parent = join(parent, part);
+    if (createParents) {
+      try { mkdirSync(parent); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+    const stat = lstatSync(parent);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Unsafe untracked parent: ${JSON.stringify(file)}`);
+  }
+  return target;
+}
+
+function copyUntrackedFile(sourceRoot: string, destinationRoot: string, file: string): void {
+  const source = untrackedPath(sourceRoot, file);
+  const sourceInfo = lstatSync(source);
+  if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) {
+    throw new Error(`Untracked symlinks and special files are not copied: ${JSON.stringify(file)}`);
+  }
+  const target = untrackedPath(destinationRoot, file, true);
+  // No-follow prevents a replaced leaf from becoming a symlink read. Exclusive
+  // creation also refuses to overwrite a tracked file or follow a destination link.
+  const input = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let output: number | undefined;
+  try {
+    const opened = fstatSync(input);
+    if (!opened.isFile() || opened.dev !== sourceInfo.dev || opened.ino !== sourceInfo.ino) {
+      throw new Error(`Untracked file changed while copying: ${JSON.stringify(file)}`);
+    }
+    output = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, opened.mode & 0o777);
+    const buffer = Buffer.alloc(64 * 1024);
+    let remaining = opened.size;
+    while (remaining > 0) {
+      const count = readSync(input, buffer, 0, Math.min(buffer.length, remaining), null);
+      if (count === 0) throw new Error(`Untracked file changed while copying: ${JSON.stringify(file)}`);
+      let written = 0;
+      while (written < count) written += writeSync(output, buffer, written, count - written);
+      remaining -= count;
+    }
+  } finally {
+    if (output !== undefined) closeSync(output);
+    closeSync(input);
+  }
+}
+
 function slug(value: string): string {
   return value
     .toLowerCase()
@@ -469,8 +551,8 @@ export class GitWorkspaceManager implements WorkspaceManager {
 
   async prepare(input: PrepareInput): Promise<PreparedWorkspace> {
     if (!isAbsolute(input.projectPath)) throw new Error("projectPath must be absolute");
-    const top = await runProcess("git", ["-C", input.projectPath, "rev-parse", "--show-toplevel"]);
-    const baseCommit = await runProcess("git", ["-C", top, "rev-parse", "--verify", "HEAD"]).catch(() => null);
+    const top = await runGit(input.projectPath, ["rev-parse", "--show-toplevel"]);
+    const baseCommit = await runGit(top, ["rev-parse", "--verify", "HEAD"]).catch(() => null);
     const uncommitted = (await this.changes(top)) ?? [];
     if (!input.useWorktree) {
       return { path: input.projectPath, branch: null, baseCommit, uncommitted, includedUncommitted: true, warnings: [] };
@@ -488,7 +570,7 @@ export class GitWorkspaceManager implements WorkspaceManager {
     const worktreePath = join(repoRoot, name);
     const branch = `bridge/${name}`;
     if (!existsSync(worktreePath)) {
-      await runProcess("git", ["-C", top, "worktree", "add", "-b", branch, worktreePath, baseCommit]);
+      await runGit(top, ["worktree", "add", "-b", branch, worktreePath, baseCommit]);
     }
 
     const warnings: string[] = [];
@@ -500,7 +582,7 @@ export class GitWorkspaceManager implements WorkspaceManager {
           includedUncommitted = true;
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
-          warnings.push(`Could not copy the main checkout's uncommitted changes (${reason}). The worktree starts from commit ${baseCommit.slice(0, 12)}.`);
+          warnings.push(`Could not copy all of the main checkout's uncommitted changes (${reason}). The worktree is based on commit ${baseCommit.slice(0, 12)} and may contain partially copied changes; inspect it before continuing.`);
         }
       } else {
         warnings.push(
@@ -510,30 +592,30 @@ export class GitWorkspaceManager implements WorkspaceManager {
     }
     // Keep the caller's subdirectory when projectPath points inside the repository.
     // Git reports it directly, so symlinks, case and Windows short names cannot confuse it.
-    const prefix = (await runProcess("git", ["-C", input.projectPath, "rev-parse", "--show-prefix"])).replace(/[\\/]+$/, "");
+    const prefix = (await runGit(input.projectPath, ["rev-parse", "--show-prefix"])).replace(/[\\/]+$/, "");
     const path = prefix ? join(worktreePath, prefix) : worktreePath;
     return { path, branch, baseCommit, uncommitted, includedUncommitted, warnings };
   }
 
   private async copyUncommitted(top: string, worktreePath: string): Promise<void> {
-    const patch = await runProcess("git", ["-C", top, "diff", "--binary", "HEAD"], { trim: false });
+    const patch = await runGit(top, ["diff", "--binary", "HEAD"], { trim: false });
     if (patch.trim()) {
-      await runProcess("git", ["-C", worktreePath, "apply", "--binary", "--whitespace=nowarn", "-"], { input: patch });
+      await runGit(worktreePath, ["apply", "--binary", "--whitespace=nowarn", "-"], { input: patch });
     }
-    const untracked = await runProcess("git", ["-C", top, "ls-files", "--others", "--exclude-standard", "-z"], {
+    const untracked = await runGit(top, ["ls-files", "--others", "--exclude-standard", "-z"], {
       trim: false,
     });
+    const sourceRoot = realpathSync(top);
+    const destinationRoot = realpathSync(worktreePath);
     for (const file of untracked.split("\0").filter(Boolean)) {
       if (file.startsWith(LEGACY_WORKTREE_DIR)) continue;
-      const target = join(worktreePath, file);
-      mkdirSync(dirname(target), { recursive: true });
-      copyFileSync(join(top, file), target);
+      copyUntrackedFile(sourceRoot, destinationRoot, file);
     }
   }
 
   async changes(path: string): Promise<string[] | null> {
     try {
-      const output = await runProcess("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=all"], {
+      const output = await runGit(path, ["status", "--porcelain=v1", "--untracked-files=all"], {
         trim: false,
       });
       return output

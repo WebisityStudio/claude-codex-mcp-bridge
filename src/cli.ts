@@ -48,6 +48,7 @@ import { SCHEMA_VERSION } from "./schema.js";
 import {
   CODEX_TOOL_TIMEOUT_SEC,
   MCP_NAME,
+  NODE_VERSION_REQUIREMENT,
   buildRegistrationPlan,
   parseCliCommand,
   resolveClaudeBinary,
@@ -63,6 +64,7 @@ const stableRoot = currentPackageRoot(layout);
 const stableServer = serverPathFor(stableRoot);
 const dbPath = defaultDbPath();
 const SKILLS = ["ask-codex", "review-with-codex", "claude-codex-coordinator"];
+const DESKTOP_SKILL = "desktop-coordinator"; // Claude Code tab tools are not available in Codex.
 const REQUIRED_TOOLS = ["bridge_register", "bridge_send", "bridge_inbox", "bridge_outbox", "ask_codex", "bridge_orchestration_wait"];
 const DAY_MS = 24 * 3_600_000;
 
@@ -112,8 +114,9 @@ function nodeVersion(binary: string): string | null {
 }
 
 /**
- * Keep the Node.js binary the apps already launch the bridge with when it is
- * still valid, so an install from a different shell never swaps it silently.
+ * Keep the Node.js binary the apps already launch the bridge with when it
+ * still meets the supported security baseline, so an install from a different
+ * shell keeps a suitable registered runtime.
  */
 function chooseNode(parsed: ParsedCliCommand, claude: string): { binary: string; version: string; source: string } {
   const claudeCommand = execute([claude, "mcp", "get", MCP_NAME]).output.match(/Command:\s*(.+)/)?.[1]?.trim();
@@ -128,9 +131,9 @@ function chooseNode(parsed: ParsedCliCommand, claude: string): { binary: string;
     if (!binary) continue;
     const version = nodeVersion(binary);
     if (version && supportedNode(version)) return { binary, version, source };
-    if (source === "--node") throw new Error(`--node ${binary} is not a runnable Node.js 22.5 or newer (${version ?? "not runnable"})`);
+    if (source === "--node") throw new Error(`--node ${binary} requires ${NODE_VERSION_REQUIREMENT} (${version ?? "not runnable"})`);
   }
-  throw new Error("No runnable Node.js 22.5 or newer was found");
+  throw new Error(`No supported Node.js runtime was found; requires ${NODE_VERSION_REQUIREMENT}`);
 }
 
 function readIfExists(path: string): string {
@@ -330,6 +333,10 @@ function installEcosystem(sourceRoot: string, force: boolean): { installed: numb
     for (const name of SKILLS) copies.push({ from: join(sourceRoot, "skills", name), to: join(target, name), directory: true });
   }
   copies.push({
+    from: join(sourceRoot, "skills", DESKTOP_SKILL),
+    to: join(homedir(), ".claude", "skills", DESKTOP_SKILL),
+    directory: true,
+  }, {
     from: join(sourceRoot, "agents", "codex-teammate.md"),
     to: join(homedir(), ".claude", "agents", "codex-teammate.md"),
     directory: false,
@@ -355,6 +362,7 @@ function removeEcosystem(): void {
   for (const target of resolveSkillTargets(homedir())) {
     for (const name of SKILLS) rmSync(join(target, name), { recursive: true, force: true });
   }
+  rmSync(join(homedir(), ".claude", "skills", DESKTOP_SKILL), { recursive: true, force: true });
   rmSync(join(homedir(), ".claude", "agents", "codex-teammate.md"), { force: true });
 }
 
@@ -414,9 +422,9 @@ async function doctor(parsed: ParsedCliCommand): Promise<number> {
   const registeredNode = readCodexServerEntry(readIfExists(codexConfigPath()), MCP_NAME).command;
   if (registeredNode) {
     const version = nodeVersion(registeredNode);
-    add(version && supportedNode(version) ? "ok" : "fail", "Node.js for the bridge", `${version ?? "not runnable"} (${registeredNode}; 22.5 or newer required)`);
+    add(version && supportedNode(version) ? "ok" : "fail", "Node.js for the bridge", `${version ?? "not runnable"} (${registeredNode}; requires ${NODE_VERSION_REQUIREMENT})`);
   } else {
-    add(supportedNode(process.version) ? "ok" : "fail", "Node.js", `${process.version} (22.5 or newer required)`);
+    add(supportedNode(process.version) ? "ok" : "fail", "Node.js", `${process.version} (requires ${NODE_VERSION_REQUIREMENT})`);
   }
 
   const current = currentVersion(layout);
@@ -679,7 +687,7 @@ Commands:
 
 Options:
   --force         setup: replace installed skill copies, or install a stale build
-  --node PATH     setup: Node.js binary the apps launch the bridge with (default: keep the current one)
+  --node PATH     setup: Node.js binary the apps launch the bridge with (default: keep a supported registered runtime)
   --fix           doctor: tighten mailbox file permissions
   --purge         uninstall: also remove local mailbox data
 `);

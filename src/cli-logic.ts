@@ -173,8 +173,21 @@ export function resolveClaudeBinary(input: { configured?: string; bundledRoot?: 
     : "claude";
 }
 
-/** True for Node.js versions the bridge supports (22.5 or newer). */
+export const NODE_VERSION_REQUIREMENT = "Node.js 22.x >=22.23.4, 24.x >=24.22.1, or 26.x >=26.12.1";
+
+// October 21, 2026 security releases. New release lines need an explicit review.
+const NODE_SECURITY_FLOORS = new Map<number, readonly [number, number]>([
+  [22, [23, 4]],
+  [24, [22, 1]],
+  [26, [12, 1]],
+]);
+
+/** Accept stable releases that meet the security floor of a supported Node.js line. */
 export function supportedNode(version: string): boolean {
-  const [major = 0, minor = 0] = versionParts(version.replace(/^v/, ""));
-  return major > 22 || (major === 22 && minor >= 5);
+  const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version);
+  if (!match || match[0] !== version) return false;
+  const [major, minor, patch] = match.slice(1).map(Number);
+  if (![major, minor, patch].every(Number.isSafeInteger)) return false;
+  const floor = NODE_SECURITY_FLOORS.get(major);
+  return !!floor && (minor > floor[0] || (minor === floor[0] && patch >= floor[1]));
 }

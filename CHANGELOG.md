@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 — 2026-10-31 (local, unpublished)
+
+- Update affected dependencies and ship npm-shrinkwrap.json so setup installs the reviewed dependency tree.
+- Require patched Node 22.23.4, 24.22.1 or 26.12.1 within their supported major lines; cover all three in CI.
+- Bound aggregate MCP inputs, message/task text and collection sizes before persistence.
+- Disable executable Git helpers during preparation and reject untracked symlink/special-file copies. LFS/custom-filter checkouts may require trusted preparation.
+- Add input-boundary and repository-helper regressions; retain existing mailbox schema and runtime rollback behavior.
+
 ## 0.4.0
 
 Driven by field use of the 0.3 mailbox with dozens of agents: Claude pings that expired instead of waking anyone, direct messages that were never acknowledged, messages sent to names that never registered, threads that outgrew MCP output limits, and Codex workers that were rarely used because calls outlived host timeouts.

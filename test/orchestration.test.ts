@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -493,4 +493,65 @@ test("worktrees live outside the repository and can carry uncommitted changes", 
   const nested = await manager.prepare({ projectPath: join(repo, "sub"), useWorktree: true, runId: "cccccccc-0000-4000-8000-000000000000", threadId: "nested" });
   assert.ok(nested.path.endsWith(join("nested-cccccccc", "sub")));
   assert.equal(readFileSync(join(nested.path, "keep.txt"), "utf8"), "sub\n");
+});
+
+test("Git preparation never runs repository hooks, fsmonitor, diff or conversion helpers", { skip: process.platform === "win32" }, async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "bridge-git-helpers-")));
+  const repo = join(base, "repo");
+  mkdirSync(repo);
+  git(base, "init", "-q", repo);
+  writeFileSync(join(repo, "tracked.txt"), "committed\n");
+  writeFileSync(join(repo, ".gitattributes"), "tracked.txt diff=fixture filter=fixture\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-q", "-m", "initial");
+  const markers = ["hook", "fsmonitor", "external-diff", "textconv", "filter"];
+  const helpers = new Map(markers.map((name) => {
+    const script = join(base, `${name}.cjs`);
+    writeFileSync(script, `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(join(base, `${name}.ran`))}, "unexpected helper execution");\n`, { mode: 0o755 });
+    return [name, script];
+  }));
+  git(repo, "config", "core.hooksPath", join(base, "hooks"));
+  mkdirSync(join(base, "hooks"));
+  writeFileSync(join(base, "hooks", "post-checkout"), readFileSync(helpers.get("hook")!), { mode: 0o755 });
+  git(repo, "config", "core.fsmonitor", helpers.get("fsmonitor")!);
+  git(repo, "config", "diff.external", helpers.get("external-diff")!);
+  git(repo, "config", "diff.fixture.textconv", helpers.get("textconv")!);
+  git(repo, "config", "filter.fixture.clean", helpers.get("filter")!);
+  git(repo, "config", "filter.fixture.smudge", helpers.get("filter")!);
+  git(repo, "config", "filter.fixture.process", helpers.get("filter")!);
+  git(repo, "config", "filter.fixture.required", "true");
+  writeFileSync(join(repo, "tracked.txt"), "owner's pending change\n");
+
+  const manager = new GitWorkspaceManager(join(base, "worktrees"));
+  const live = await manager.prepare({ projectPath: repo, useWorktree: false, runId: "dddddddd-0000-4000-8000-000000000000", threadId: "inspect" });
+  assert.ok(live.uncommitted.length > 0);
+  const copied = await manager.prepare({ projectPath: repo, useWorktree: true, includeUncommitted: true,
+    runId: "eeeeeeee-0000-4000-8000-000000000000", threadId: "copy" });
+  assert.equal(copied.includedUncommitted, true);
+  assert.deepEqual(copied.warnings, []);
+  assert.equal(readFileSync(join(copied.path, "tracked.txt"), "utf8"), "owner's pending change\n");
+  assert.ok((await manager.changes(copied.path))?.length);
+  for (const name of markers) assert.equal(existsSync(join(base, `${name}.ran`)), false, `${name} must not run outside the worker sandbox`);
+});
+
+test("copying uncommitted work rejects an untracked symlink to an outside file", { skip: process.platform === "win32" }, async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "bridge-git-link-")));
+  const repo = join(base, "repo");
+  mkdirSync(repo);
+  git(base, "init", "-q", repo);
+  writeFileSync(join(repo, "tracked.txt"), "committed\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-q", "-m", "initial");
+  const outside = join(base, "outside-marker.txt");
+  writeFileSync(outside, "dummy outside-workspace data\n");
+  symlinkSync(outside, join(repo, "outside-link.txt"));
+
+  const manager = new GitWorkspaceManager(join(base, "worktrees"));
+  const copied = await manager.prepare({ projectPath: repo, useWorktree: true, includeUncommitted: true,
+    runId: "ffffffff-0000-4000-8000-000000000000", threadId: "reject-link" });
+  assert.equal(copied.includedUncommitted, false);
+  assert.match(copied.warnings.join("\n"), /symlinks and special files are not copied/);
+  assert.equal(existsSync(join(copied.path, "outside-link.txt")), false);
+  assert.equal(lstatSync(join(repo, "outside-link.txt")).isSymbolicLink(), true);
+  assert.equal(readFileSync(outside, "utf8"), "dummy outside-workspace data\n");
 });

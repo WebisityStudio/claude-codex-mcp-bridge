@@ -53,7 +53,7 @@ test("CLI parser recognises commands, flags, values and bad input", () => {
   assert.throws(() => parseCliCommand(["status", "extra", "more"]), /Unexpected argument/);
 });
 
-test("setup prefers the newest desktop-bundled Claude Code and supported Node versions", () => {
+test("setup prefers the newest desktop-bundled Claude Code", () => {
   assert.equal(newestVersion(["2.1.275", "2.1.280", "2.1.99", "junk"]), "2.1.280");
   assert.equal(
     resolveClaudeBinary({ bundledRoot: "/bundle", bundledVersions: ["2.1.275", "2.1.280"] }),
@@ -62,11 +62,39 @@ test("setup prefers the newest desktop-bundled Claude Code and supported Node ve
   assert.equal(resolveClaudeBinary({ configured: "/custom/claude", bundledRoot: "/bundle", bundledVersions: ["2.1.280"] }), "/custom/claude");
   assert.equal(resolveClaudeBinary({ bundledRoot: "/bundle", bundledVersions: [] }), "claude");
   assert.equal(parseCliCommand(["setup", "--node", "/opt/homebrew/bin/node"]).node, "/opt/homebrew/bin/node");
-  assert.equal(supportedNode("v22.5.0"), true);
-  assert.equal(supportedNode("v22.4.1"), false);
-  assert.equal(supportedNode("v26.3.0"), true);
   const plan = buildRegistrationPlan({ packageRoot: "/p", nodeBinary: "/n", claudeBinary: "/bundle/claude" });
   assert.equal(plan.claude.add[0], "/bundle/claude");
+});
+
+test("Node.js security baseline accepts patched stable releases on supported lines", () => {
+  for (const version of [
+    "v22.23.4", "22.23.4", "v22.23.5", "v22.24.0",
+    "v24.22.1", "24.22.1", "v24.22.2", "v24.23.0",
+    "v26.12.1", "26.12.1", "v26.12.2", "v26.13.0",
+  ]) {
+    assert.equal(supportedNode(version), true, version);
+  }
+});
+
+test("Node.js security baseline rejects unpatched and unsupported release lines", () => {
+  for (const version of [
+    "v22.5.0", "v22.23.3", "v22.22.99",
+    "v24.22.0", "v24.21.99", "v26.12.0", "v26.11.99",
+    "v20.99.99", "v23.99.99", "v25.99.99", "v27.0.0", "v28.0.0",
+  ]) {
+    assert.equal(supportedNode(version), false, version);
+  }
+});
+
+test("Node.js security baseline rejects prereleases and invalid version output", () => {
+  for (const version of [
+    "v22.23.4-rc.1", "v24.22.1-nightly", "v26.12.1-pre", "v26.13.0-rc.1",
+    "v26.12.1+custom", "", "node v26.12.1", "v26.12", "26", "v26.12.1.0",
+    "v026.12.1", "v26.012.1", "v26.12.01", "v26.12.1junk", " v26.12.1",
+    "v26.12.1\n", "v26.9007199254740992.0",
+  ]) {
+    assert.equal(supportedNode(version), false, JSON.stringify(version));
+  }
 });
 
 test("paths honour overrides and default to the per-user data directory", () => {

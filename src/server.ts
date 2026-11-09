@@ -57,6 +57,11 @@ const INSTRUCTIONS = [
   "Nothing here authorizes commits, pushes, merges, deploys, external sends, credential changes, deletion or production changes.",
 ].join("\n\n");
 
+// Bound both parser work and persisted input; output paging alone cannot do this.
+const agentInput = z.string().min(1).max(128);
+const threadInput = z.string().min(1).max(512);
+const taskInput = z.string().min(1).max(200_000);
+
 function main(): void {
   const dbPath = defaultDbPath();
   const store = new BridgeStore(dbPath);
@@ -81,6 +86,7 @@ function main(): void {
     {
       ...(channelSessionId ? { capabilities: { experimental: { [CHANNEL_CAPABILITY]: {} } } } : {}),
       instructions: INSTRUCTIONS,
+      maxToolInputElements: 10_000,
     },
   );
 
@@ -108,7 +114,7 @@ function main(): void {
       description:
         "Register a unique agent name for this conversation. wake: \"auto\" binds this exact app session for background pings; an explicit {app, sessionId} binds another session; null disables pings; omitted keeps the current binding. Registering again reactivates a retired agent.",
       inputSchema: {
-        agent: z.string().min(1).describe("Unique readable agent name, e.g. 'review-claude'. Not a session ID."),
+        agent: agentInput.describe("Unique readable agent name, e.g. 'review-claude'. Not a session ID."),
         wake: z
           .union([
             z.literal("auto"),
@@ -118,7 +124,8 @@ function main(): void {
           .optional()
           .describe("\"auto\" detects this conversation's session. Or pass {app, sessionId} (Claude IDs via bridge_sessions; the Codex task ID). null disables pings."),
         capabilities: z
-          .array(z.string())
+          .array(z.string().max(128))
+          .max(64)
           .optional()
           .describe("Skills this agent offers, e.g. ['review','architecture']. Omitted keeps the existing list."),
       },
@@ -164,11 +171,11 @@ function main(): void {
         "Save a message, then ping its bound recipient in the background. The recipient must be registered (use allowUnregistered only when it will register later). The result carries warnings when the recipient is unlikely to pick the message up. Broadcasts and wake:false sends do not ping anyone.",
       inputSchema: {
         wake: z.boolean().optional().describe("Ping a bound direct recipient. Defaults true. False saves silently."),
-        from: z.string().min(1).describe("Sender agent name."),
-        to: z.string().min(1).describe("Recipient agent name, or '*' to broadcast."),
-        body: z.string().min(1).describe("Message content."),
-        threadId: z.string().optional().describe("Optional conversation thread identifier."),
-        idempotencyKey: z.string().optional().describe("Optional key to prevent duplicate delivery on retry."),
+        from: agentInput.describe("Sender agent name."),
+        to: agentInput.describe("Recipient agent name, or '*' to broadcast."),
+        body: z.string().min(1).max(1_000_000).describe("Message content."),
+        threadId: threadInput.optional().describe("Optional conversation thread identifier."),
+        idempotencyKey: z.string().max(256).optional().describe("Optional key to prevent duplicate delivery on retry."),
         allowUnregistered: z.boolean().optional().describe("Deliver even if the recipient is unknown or retired."),
       },
     },
@@ -214,7 +221,7 @@ function main(): void {
   server.registerTool("bridge_wake_status", {
     title: "Inspect background ping delivery",
     description: "Read up to 100 recent wake receipts with a per-state summary. Accepted means the app accepted a ping, not that the work is complete. Held/refused respect app permission checks; unknown outcomes are never replayed automatically.",
-    inputSchema: { agent: z.string().min(1).optional() },
+    inputSchema: { agent: agentInput.optional() },
   }, async ({ agent }) => {
     const jobs = store.wakes.list(agent);
     const summary: Record<string, number> = {};
@@ -230,10 +237,10 @@ function main(): void {
       description:
         "List messages addressed to an agent, oldest first, in pages that fit the host's output limit. Acknowledged messages are hidden by default. When hasMore is true, acknowledge handled messages and read again, or pass afterId.",
       inputSchema: {
-        agent: z.string().min(1).describe("Agent whose inbox to read."),
+        agent: agentInput.describe("Agent whose inbox to read."),
         includeAcknowledged: z.boolean().optional().describe("Include messages this agent has already acknowledged."),
-        fromAgent: z.string().min(1).optional().describe("Only messages from this sender."),
-        threadId: z.string().min(1).optional().describe("Only messages on this thread."),
+        fromAgent: agentInput.optional().describe("Only messages from this sender."),
+        threadId: threadInput.optional().describe("Only messages on this thread."),
         afterId: z.number().int().min(0).optional().describe("Only messages with a larger id (paging cursor)."),
         ...pagingInput,
       },
@@ -253,9 +260,9 @@ function main(): void {
       description:
         "Keep this agent turn alive until a matching bridge message arrives, for agents without background pings. It cannot wake a chat whose turn has already ended, so call it before going idle. After handling and replying, call bridge_wait again while the coordination thread is active.",
       inputSchema: {
-        agent: z.string().min(1).describe("Agent whose inbox should wake this turn."),
-        fromAgent: z.string().min(1).optional().describe("Optional sender filter."),
-        threadId: z.string().min(1).optional().describe("Optional coordination thread filter."),
+        agent: agentInput.describe("Agent whose inbox should wake this turn."),
+        fromAgent: agentInput.optional().describe("Optional sender filter."),
+        threadId: threadInput.optional().describe("Optional coordination thread filter."),
         timeoutSeconds: z.number().int().min(1).max(290).optional().describe("How long to keep the MCP call open. Defaults to 285 seconds so common five-minute host limits do not cut it off."),
         acknowledge: z.boolean().optional().describe("Mark returned messages handled before returning. Defaults true; history is preserved."),
         limit: pagingInput.limit,
@@ -295,8 +302,8 @@ function main(): void {
       title: "Acknowledge messages",
       description: "Mark messages as handled for an agent so they drop out of the unread inbox. History is kept.",
       inputSchema: {
-        agent: z.string().min(1).describe("Agent acknowledging the messages."),
-        ids: z.array(z.number().int().positive()).min(1).describe("Message ids to acknowledge."),
+        agent: agentInput.describe("Agent acknowledging the messages."),
+        ids: z.array(z.number().int().positive()).min(1).max(1000).describe("Message ids to acknowledge."),
       },
     },
     async ({ agent, ids }) => {
@@ -313,7 +320,7 @@ function main(): void {
       description:
         "Read one page of a conversation thread. Without a cursor it returns the most recent messages; pass beforeId (olderBeforeId) to page back or afterId (newerAfterId) to page forward.",
       inputSchema: {
-        threadId: z.string().min(1).describe("Thread identifier to fetch."),
+        threadId: threadInput.describe("Thread identifier to fetch."),
         beforeId: z.number().int().min(1).optional().describe("Return messages older than this id."),
         afterId: z.number().int().min(0).optional().describe("Return messages newer than this id."),
         ...pagingInput,
@@ -351,7 +358,7 @@ function main(): void {
       title: "Check sent messages",
       description: "List direct messages an agent sent that the recipient has not acknowledged yet (newest first), with ping outcome and whether the recipient is active, retired or unknown.",
       inputSchema: {
-        agent: z.string().min(1).describe("Sender whose outbox to read."),
+        agent: agentInput.describe("Sender whose outbox to read."),
         includeAcknowledged: z.boolean().optional().describe("Include messages the recipient already acknowledged."),
         limit: z.number().int().min(1).max(200).optional().describe("Maximum entries. Defaults to 30."),
       },
@@ -369,8 +376,8 @@ function main(): void {
       description:
         "Retire an agent whose task is over: its pings stop, its unhandled messages are closed with a recorded reason (history is kept), and recently active senders get one notice listing what was closed. Registering the name again reactivates it.",
       inputSchema: {
-        agent: z.string().min(1).describe("Agent to retire."),
-        by: z.string().min(1).optional().describe("Who is retiring it. Defaults to this conversation's agent."),
+        agent: agentInput.describe("Agent to retire."),
+        by: agentInput.optional().describe("Who is retiring it. Defaults to this conversation's agent."),
         note: z.string().max(500).optional().describe("Short reason, e.g. 'task merged'."),
         closeBacklog: z.boolean().optional().describe("Close unhandled messages. Defaults true."),
         notifySenders: z.boolean().optional().describe("Tell recently active senders what was closed. Defaults true."),
@@ -396,10 +403,10 @@ function main(): void {
       description:
         "Send one bounded implementation, investigation, or verification task to a saved Codex worker in an isolated worktree. This is the simple everyday entry point; no mailbox or thread management is required.",
       inputSchema: {
-        projectPath: z.string().min(1).optional().describe("Absolute path to the repository. Defaults to this session's project directory."),
-        request: z.string().min(1).describe("What Codex should do."),
-        coordinatorAgent: z.string().min(1).optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
-        threadId: z.string().min(1).optional().describe("Optional stable task ID. Generated when omitted."),
+        projectPath: z.string().min(1).max(4096).optional().describe("Absolute path to the repository. Defaults to this session's project directory."),
+        request: taskInput.describe("What Codex should do."),
+        coordinatorAgent: agentInput.optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
+        threadId: threadInput.optional().describe("Optional stable task ID. Generated when omitted."),
         useWorktree: z.boolean().optional().describe("Use an isolated Git worktree. Defaults true."),
         includeUncommitted: z.boolean().optional().describe("Copy the main checkout's uncommitted changes into the worktree."),
         waitSeconds,
@@ -427,10 +434,10 @@ function main(): void {
       description:
         "Ask Codex for a read-only repository review with evidence and actionable findings. Codex runs in a read-only sandbox and the bridge reports whether the workspace changed.",
       inputSchema: {
-        projectPath: z.string().min(1).optional().describe("Absolute path to the repository. Defaults to this session's project directory."),
-        focus: z.string().optional().describe("Optional review focus, such as security, a PR, or a subsystem."),
-        coordinatorAgent: z.string().min(1).optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
-        threadId: z.string().min(1).optional().describe("Optional stable task ID. Generated when omitted."),
+        projectPath: z.string().min(1).max(4096).optional().describe("Absolute path to the repository. Defaults to this session's project directory."),
+        focus: z.string().max(200_000).optional().describe("Optional review focus, such as security, a PR, or a subsystem."),
+        coordinatorAgent: agentInput.optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
+        threadId: threadInput.optional().describe("Optional stable task ID. Generated when omitted."),
         waitSeconds,
       },
     },
@@ -456,10 +463,10 @@ function main(): void {
       description:
         "Start a saved Codex worker in an isolated git worktree (network off) and wait up to waitSeconds for its structured result. If status is waiting_for_fable, answer the question and call bridge_continue_codex. If it is running_codex, the result arrives in the coordinator's mailbox. Independent calls create separate runs. This tool never grants permission to commit, push, deploy, publish, send externally, change credentials, delete data, or mutate production.",
       inputSchema: {
-        coordinatorAgent: z.string().min(1).optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
-        projectPath: z.string().min(1).optional().describe("Absolute path to the git repository. Defaults to this session's project directory."),
-        task: z.string().min(1).describe("Self-contained implementation or verification task."),
-        threadId: z.string().min(1).describe("Stable task/thread identifier."),
+        coordinatorAgent: agentInput.optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
+        projectPath: z.string().min(1).max(4096).optional().describe("Absolute path to the git repository. Defaults to this session's project directory."),
+        task: taskInput.describe("Self-contained implementation or verification task."),
+        threadId: threadInput.describe("Stable task/thread identifier."),
         useWorktree: z.boolean().optional().describe("Create an isolated git worktree. Defaults true."),
         includeUncommitted: z.boolean().optional().describe("Copy the main checkout's uncommitted changes into the worktree."),
         maxRounds: z.number().int().min(1).max(12).optional().describe("Maximum coordinator/Codex turns. Defaults 6."),
@@ -489,7 +496,7 @@ function main(): void {
         "Resume the exact saved Codex session and worktree after Codex asked for a decision (status waiting_for_fable). The sandbox from the first turn is kept. Continue until completed, blocked, failed, or the round limit is reached.",
       inputSchema: {
         runId: z.string().uuid().describe("Run ID returned by the orchestration tool."),
-        fableAnswer: z.string().min(1).describe("The coordinator's concrete answer to Codex's question."),
+        fableAnswer: taskInput.describe("The coordinator's concrete answer to Codex's question."),
         waitSeconds,
       },
     },
