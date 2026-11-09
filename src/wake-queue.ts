@@ -39,6 +39,8 @@ export const OFFLINE_WAKE_WINDOW_MS = 3_600_000;
 export const BUSY_WAKE_WINDOW_MS = 24 * 3_600_000;
 /** A channel host that has not refreshed within this window is gone. */
 export const CHANNEL_HOST_TTL_MS = 15_000;
+/** How many of the latest receipts a status summary covers. */
+export const RECENT_WAKE_JOBS = 100;
 const FAILED_STATES = "('refused', 'expired', 'held')";
 
 export class WakeQueue {
@@ -90,11 +92,31 @@ export class WakeQueue {
     };
   }
 
-  list(agent?: string): WakeJob[] {
-    const rows = agent === undefined
-      ? this.db.prepare("SELECT * FROM wake_jobs ORDER BY id DESC LIMIT 100").all()
-      : this.db.prepare("SELECT * FROM wake_jobs WHERE agent = ? ORDER BY id DESC LIMIT 100").all(agent);
+  /** Ping receipts, newest first. `beforeId` pages back in time. */
+  list(agent?: string, options: { limit?: number; beforeId?: number } = {}): WakeJob[] {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (agent !== undefined) { clauses.push("agent = ?"); params.push(agent); }
+    if (options.beforeId !== undefined) { clauses.push("id < ?"); params.push(options.beforeId); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const limit = Math.min(Math.max(Math.trunc(options.limit ?? RECENT_WAKE_JOBS), 1), 2 * RECENT_WAKE_JOBS);
+    const rows = this.db.prepare(`SELECT * FROM wake_jobs ${where} ORDER BY id DESC LIMIT ?`).all(...params, limit);
     return rows.map(row => this.row(row));
+  }
+
+  /** Per-state counts over the latest receipts, without loading their messages. */
+  recentStates(agent?: string, window = RECENT_WAKE_JOBS): { jobs: number; byState: Record<string, number>; claudeHold: boolean } {
+    const filter = agent === undefined ? "" : "WHERE agent = ?";
+    const rows = this.db.prepare(`SELECT state, detail, json_extract(target, '$.app') AS app FROM wake_jobs ${filter}
+      ORDER BY id DESC LIMIT ?`).all(...(agent === undefined ? [] : [agent]), window);
+    const byState: Record<string, number> = {};
+    let claudeHold = false;
+    for (const row of rows) {
+      const state = row.state as string;
+      byState[state] = (byState[state] ?? 0) + 1;
+      if (row.app === "claude" && (state === "held" || /expired|held/i.test(row.detail as string))) claudeHold = true;
+    }
+    return { jobs: rows.length, byState, claudeHold };
   }
 
   forMessage(messageId: number): WakeJob | null {

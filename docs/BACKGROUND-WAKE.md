@@ -28,7 +28,7 @@ Omitting `wake` from registration preserves the current binding. `wake: null` di
 
 ## Delivery evidence
 
-`bridge_wake_status` returns up to 100 recent jobs with a per-state summary, optionally filtered by agent.
+`bridge_wake_status` returns the 20 most recent jobs (up to 100 with `limit`), optionally filtered by agent, with a per-state summary of the latest 100. Each page fits the host's output limit; pass `beforeId` with the returned `olderBeforeId` to read older jobs. Previews are shortened to 120 characters and the mailbox path is given once.
 
 | State | Meaning |
 |---|---|

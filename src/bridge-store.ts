@@ -35,6 +35,21 @@ export interface AgentSummary extends BridgeAgent {
   lastActivity: string;
 }
 
+export interface AgentPageOptions {
+  includeRetired?: boolean;
+  /** Case-insensitive text to find in agent names or capabilities. */
+  query?: string;
+  /** Defaults to 50. */
+  limit?: number;
+  offset?: number;
+}
+
+export interface AgentPage {
+  /** How many agents matched, across all pages. */
+  total: number;
+  agents: AgentSummary[];
+}
+
 export type OrchestrationStatus =
   | "created"
   | "running_codex"
@@ -665,6 +680,50 @@ export class BridgeStore {
       unread: Number(row.unread),
       lastActivity: row.last_activity,
     }));
+  }
+
+  /**
+   * One page of agents, most recently active first. Activity is aggregated
+   * once per table rather than once per agent, and unread counts are worked
+   * out only for the page, so the cost stays flat as agents accumulate.
+   */
+  agentPage(options: AgentPageOptions = {}): AgentPage {
+    const limit = clampLimit(options.limit, 50);
+    const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+    const clauses: string[] = [];
+    const params: Param[] = [];
+    if (!options.includeRetired) clauses.push("ag.retired_at IS NULL");
+    const query = options.query?.trim();
+    if (query) {
+      clauses.push("(instr(lower(ag.name), lower(?)) > 0 OR instr(lower(ag.capabilities), lower(?)) > 0)");
+      params.push(query, query);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const total = this.db.prepare(`SELECT COUNT(*) AS n FROM agents ag ${where}`).get(...params) as {
+      n: number | bigint;
+    };
+    const rows = this.db
+      .prepare(
+        `WITH sent AS (SELECT from_agent AS name, MAX(created_at) AS at FROM messages GROUP BY from_agent),
+              acked AS (SELECT agent AS name, MAX(acked_at) AS at FROM acknowledgements GROUP BY agent)
+         SELECT ag.*,
+                MAX(ag.last_seen, COALESCE(sent.at, ''), COALESCE(acked.at, '')) AS last_activity
+         FROM agents ag
+         LEFT JOIN sent ON sent.name = ag.name
+         LEFT JOIN acked ON acked.name = ag.name
+         ${where}
+         ORDER BY last_activity DESC, ag.name ASC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(...params, limit, offset) as unknown as Array<AgentRow & { last_activity: string }>;
+    return {
+      total: Number(total.n),
+      agents: rows.map((row) => ({
+        ...this.toAgent(row),
+        unread: this.countUnread(row.name),
+        lastActivity: row.last_activity,
+      })),
+    };
   }
 
   /**

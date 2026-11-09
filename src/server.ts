@@ -14,12 +14,12 @@ import { waitForInbox } from "./inbox-waiter.js";
 import { retireAgent } from "./lifecycle.js";
 import { BRIDGE_AGENT, CLAUDE_HOLD_EXPLANATION } from "./notices.js";
 import { DEFAULT_WAIT_MS, Orchestrator } from "./orchestrator.js";
-import { clampLimit, fitMessages } from "./paging.js";
+import { DEFAULT_PAGE_CHARS, clampLimit, fitMessages, fitRows } from "./paging.js";
 import { defaultDbPath, runsDir } from "./paths.js";
 import { buildAskCodexTask, buildCodexReviewTask } from "./simple-tools.js";
 import { VERSION } from "./version.js";
 import { WakeDispatcher } from "./wake-dispatcher.js";
-import type { WakeTarget } from "./wake-queue.js";
+import { RECENT_WAKE_JOBS, type WakeJob, type WakeTarget } from "./wake-queue.js";
 
 /** Everything the MCP protocol reads/writes must stay on stdout; logs go to stderr. */
 function log(message: string): void {
@@ -31,6 +31,32 @@ function jsonResult(payload: unknown) {
     content: [
       { type: "text" as const, text: JSON.stringify(payload, null, 2) },
     ],
+  };
+}
+
+/** Longest message preview in a ping receipt listing; the full body stays in the mailbox. */
+const RECEIPT_PREVIEW_CHARS = 120;
+
+/**
+ * A ping receipt as bridge_wake_status lists it: the delivery facts, without
+ * empty fields, internal attempt ids or the mailbox path repeated on every row.
+ */
+function wakeReceipt(job: WakeJob) {
+  return {
+    id: job.id,
+    messageId: job.messageId,
+    agent: job.agent,
+    ...(job.fromAgent ? { fromAgent: job.fromAgent } : {}),
+    ...(job.threadId ? { threadId: job.threadId } : {}),
+    target: job.target,
+    state: job.state,
+    detail: job.detail,
+    ...(job.pendingReason ? { pendingReason: job.pendingReason } : {}),
+    attempts: job.attempts,
+    createdAt: job.createdAt,
+    ...(job.state === "pending" ? { retryAt: job.retryAt } : {}),
+    ...(job.acknowledgedAt ? { acknowledgedAt: job.acknowledgedAt } : {}),
+    ...(job.preview ? { preview: job.preview.slice(0, RECEIPT_PREVIEW_CHARS) } : {}),
   };
 }
 
@@ -100,6 +126,12 @@ function main(): void {
       : null,
   });
   const housekeeper = new Housekeeper(store, orchestrator, { runsDir: runsDir(), log });
+
+  // A waiting call can outlive its caller: the user stops the turn, the host
+  // times the call out, or the host process disappears. Waits watch for all
+  // three, so nothing is acknowledged or claimed for a caller that has gone.
+  const closing = new AbortController();
+  const callerGone = (extra: { signal: AbortSignal }) => AbortSignal.any([extra.signal, closing.signal]);
 
   const pagingInput = {
     limit: z.number().int().min(1).max(200).optional().describe("Maximum messages to return. Defaults to 25 (30 for threads)."),
@@ -220,14 +252,29 @@ function main(): void {
 
   server.registerTool("bridge_wake_status", {
     title: "Inspect background ping delivery",
-    description: "Read up to 100 recent wake receipts with a per-state summary. Accepted means the app accepted a ping, not that the work is complete. Held/refused respect app permission checks; unknown outcomes are never replayed automatically.",
-    inputSchema: { agent: agentInput.optional() },
-  }, async ({ agent }) => {
-    const jobs = store.wakes.list(agent);
-    const summary: Record<string, number> = {};
-    for (const job of jobs) summary[job.state] = (summary[job.state] ?? 0) + 1;
-    const claudeHolds = jobs.some((job) => job.target.app === "claude" && (job.state === "held" || /expired|held/i.test(job.detail)));
-    return jsonResult({ summary, ...(claudeHolds ? { explanation: CLAUDE_HOLD_EXPLANATION } : {}), jobs });
+    description: "Read recent ping receipts, newest first, with a per-state summary of the latest 100. Returns 20 receipts by default in a page that fits the host's output limit; pass beforeId (olderBeforeId) for older ones. Accepted means the app accepted a ping, not that the work is complete. Held/refused respect app permission checks; unknown outcomes are never replayed automatically.",
+    inputSchema: {
+      agent: agentInput.optional().describe("Only pings to this recipient."),
+      limit: z.number().int().min(1).max(RECENT_WAKE_JOBS).optional().describe("Maximum receipts to return. Defaults to 20."),
+      beforeId: z.number().int().min(1).optional().describe("Return receipts older than this receipt id (paging cursor)."),
+    },
+  }, async ({ agent, limit, beforeId }) => {
+    const max = limit ?? 20;
+    const recent = store.wakes.recentStates(agent);
+    const listed = store.wakes.list(agent, { limit: max + 1, beforeId });
+    // Room for the summary and, when Claude holds pings, the explanation.
+    const fitted = fitRows(listed.slice(0, max).map(wakeReceipt), DEFAULT_PAGE_CHARS, 2_000);
+    const hasMore = listed.length > max || fitted.omitted > 0;
+    return jsonResult({
+      mailboxPath: dbPath,
+      summary: recent.byState,
+      summaryOf: recent.jobs,
+      ...(recent.claudeHold ? { explanation: CLAUDE_HOLD_EXPLANATION } : {}),
+      count: fitted.rows.length,
+      hasMore,
+      olderBeforeId: hasMore ? fitted.rows.at(-1)?.id ?? null : null,
+      jobs: fitted.rows,
+    });
   });
 
   server.registerTool(
@@ -269,8 +316,9 @@ function main(): void {
         maxChars: pagingInput.maxChars,
       },
     },
-    async ({ agent, fromAgent, threadId, timeoutSeconds, acknowledge, limit, maxChars }) => {
+    async ({ agent, fromAgent, threadId, timeoutSeconds, acknowledge, limit, maxChars }, extra) => {
       const max = clampLimit(limit);
+      const signal = callerGone(extra);
       store.touch(agent);
       const result = await waitForInbox(store, {
         agent,
@@ -278,7 +326,20 @@ function main(): void {
         threadId,
         timeoutMs: (timeoutSeconds ?? 285) * 1000,
         limit: max + 1,
+        signal,
       });
+      if (result.aborted || signal.aborted) {
+        // Nobody receives this result, so the messages stay unread for the next reader.
+        return jsonResult({
+          timedOut: false,
+          cancelled: true,
+          count: 0,
+          acknowledged: 0,
+          hasMore: false,
+          messages: [],
+          nextAction: "This wait was cancelled before anything was returned or acknowledged. Read bridge_inbox, or call bridge_wait again.",
+        });
+      }
       const fitted = fitMessages(result.messages.slice(0, max), { maxChars });
       const ids = fitted.messages.map((message) => message.id);
       const acknowledged = (acknowledge ?? true) && ids.length > 0 ? store.ack(agent, ids) : 0;
@@ -334,21 +395,41 @@ function main(): void {
     "bridge_agents",
     {
       title: "List agents",
-      description: "List registered agents with unread counts, last activity, ping binding and recent ping health. Retired agents are hidden unless requested.",
+      description: "List registered agents, most recently active first, with unread counts, last activity, ping binding and recent ping health. Returns 50 by default in a page that fits the host's output limit: total says how many matched, and nextOffset continues the list. Use query to find agents by name or capability. Retired agents are hidden unless requested.",
       inputSchema: {
         includeRetired: z.boolean().optional().describe("Include retired agents."),
+        query: z.string().min(1).max(128).optional().describe("Only agents whose name or capabilities contain this text (case-insensitive)."),
+        limit: z.number().int().min(1).max(200).optional().describe("Maximum agents to return. Defaults to 50."),
+        offset: z.number().int().min(0).optional().describe("Skip this many agents (paging cursor; pass nextOffset)."),
       },
     },
-    async ({ includeRetired }) => {
-      const agents = store.agentSummaries({ includeRetired }).map((agent) => {
+    async ({ includeRetired, query, limit, offset }) => {
+      const start = offset ?? 0;
+      const page = store.agentPage({ includeRetired, query, limit, offset: start });
+      const rows = page.agents.map((agent) => {
         const health = store.wakes.health(agent.name, 1)[0];
         return {
-          ...agent,
+          name: agent.name,
+          ...(agent.capabilities.length ? { capabilities: agent.capabilities } : {}),
+          registeredAt: agent.registeredAt,
+          lastSeen: agent.lastSeen,
+          lastActivity: agent.lastActivity,
+          unread: agent.unread,
           wake: store.wakes.target(agent.name),
           ...(health ? { lastPing: { state: health.state, detail: health.detail } } : {}),
+          ...(agent.retiredAt ? { retiredAt: agent.retiredAt, retiredBy: agent.retiredBy, retireNote: agent.retireNote } : {}),
         };
       });
-      return jsonResult({ count: agents.length, agents });
+      const fitted = fitRows(rows, DEFAULT_PAGE_CHARS, 1_000);
+      const next = start + fitted.rows.length;
+      const hasMore = next < page.total;
+      return jsonResult({
+        count: fitted.rows.length,
+        total: page.total,
+        hasMore,
+        nextOffset: hasMore ? next : null,
+        agents: fitted.rows,
+      });
     },
   );
 
@@ -412,7 +493,7 @@ function main(): void {
         waitSeconds,
       },
     },
-    async ({ projectPath, request, coordinatorAgent, threadId, useWorktree, includeUncommitted, waitSeconds: seconds }) =>
+    async ({ projectPath, request, coordinatorAgent, threadId, useWorktree, includeUncommitted, waitSeconds: seconds }, extra) =>
       jsonResult(
         await orchestrator.start({
           coordinatorAgent: coordinatorAgent ?? defaultAgent(),
@@ -423,6 +504,7 @@ function main(): void {
           includeUncommitted,
           maxRounds: 4,
           waitMs: waitMs(seconds),
+          signal: callerGone(extra),
         }),
       ),
   );
@@ -441,7 +523,7 @@ function main(): void {
         waitSeconds,
       },
     },
-    async ({ projectPath, focus, coordinatorAgent, threadId, waitSeconds: seconds }) =>
+    async ({ projectPath, focus, coordinatorAgent, threadId, waitSeconds: seconds }, extra) =>
       jsonResult(
         await orchestrator.start({
           coordinatorAgent: coordinatorAgent ?? defaultAgent(),
@@ -452,6 +534,7 @@ function main(): void {
           sandbox: "read-only",
           maxRounds: 1,
           waitMs: waitMs(seconds),
+          signal: callerGone(extra),
         }),
       ),
   );
@@ -473,7 +556,7 @@ function main(): void {
         waitSeconds,
       },
     },
-    async ({ coordinatorAgent, projectPath, task, threadId, useWorktree, includeUncommitted, maxRounds, waitSeconds: seconds }) =>
+    async ({ coordinatorAgent, projectPath, task, threadId, useWorktree, includeUncommitted, maxRounds, waitSeconds: seconds }, extra) =>
       jsonResult(
         await orchestrator.start({
           coordinatorAgent: coordinatorAgent ?? defaultAgent(),
@@ -484,6 +567,7 @@ function main(): void {
           includeUncommitted,
           maxRounds: maxRounds ?? 6,
           waitMs: waitMs(seconds),
+          signal: callerGone(extra),
         }),
       ),
   );
@@ -500,8 +584,8 @@ function main(): void {
         waitSeconds,
       },
     },
-    async ({ runId, fableAnswer, waitSeconds: seconds }) =>
-      jsonResult(await orchestrator.continueWithFable(runId, fableAnswer, waitMs(seconds))),
+    async ({ runId, fableAnswer, waitSeconds: seconds }, extra) =>
+      jsonResult(await orchestrator.continueWithFable(runId, fableAnswer, waitMs(seconds), callerGone(extra))),
   );
 
   server.registerTool(
@@ -514,7 +598,8 @@ function main(): void {
         timeoutSeconds: z.number().int().min(0).max(285).optional().describe("Defaults to 240 seconds."),
       },
     },
-    async ({ runId, timeoutSeconds }) => jsonResult(await orchestrator.wait(runId, waitMs(timeoutSeconds))),
+    async ({ runId, timeoutSeconds }, extra) =>
+      jsonResult(await orchestrator.wait(runId, waitMs(timeoutSeconds), callerGone(extra))),
   );
 
   server.registerTool(
@@ -535,6 +620,7 @@ function main(): void {
   const shutdown = (signal: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
+    closing.abort();
     log(`received ${signal}, shutting down`);
     housekeeper.stop();
     orchestrator.close();
@@ -544,6 +630,9 @@ function main(): void {
     });
   };
   server.server.onclose = () => shutdown("transport closed");
+  // The SDK's stdio transport does not watch for end of input. A host that
+  // crashes or is force-quit closes the pipe without sending a signal.
+  process.stdin.once("end", () => shutdown("end of input"));
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Waiting calls now notice when their caller has gone (the turn was stopped, the host timed the call out, or the host process disappeared). A `bridge_wait` without a caller no longer acknowledges messages that arrive afterwards, so they stay unread. A Codex result that finishes after its caller cancelled is posted to the coordinator's mailbox instead of being claimed for nobody.
+- The bridge shuts down when its host closes the input pipe without sending a signal.
+- `bridge_agents` and `bridge_wake_status` now return pages that fit the host's output limit, like inbox and thread reads. With about 200 active agents they had grown to more than 100,000 characters each.
+  - `bridge_agents` lists the most recently active agents first, 50 by default, with `total`, `hasMore` and `nextOffset`; `query` finds agents by name or capability. Empty fields are left out.
+  - `bridge_wake_status` lists 20 receipts by default (`limit` up to 100) and pages back with `beforeId`. The summary still covers the latest 100 receipts. Previews are 120 characters, and the mailbox path appears once instead of on every receipt.
+
 ## 0.4.1 — 2026-10-31 (local, unpublished)
 
 - Update affected dependencies and ship npm-shrinkwrap.json so setup installs the reviewed dependency tree.

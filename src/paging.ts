@@ -58,6 +58,35 @@ export function fitMessages(
   return { messages: views, omitted: messages.length - views.length };
 }
 
+/** Characters one row occupies inside a pretty-printed `{ "rows": [ ... ] }` result. */
+function renderedChars(row: unknown): number {
+  const text = JSON.stringify(row, null, 2) ?? "";
+  // Each line gains four spaces of nesting and a newline; the row gains a comma.
+  return text.length + (text.split("\n").length) * 5 + 1;
+}
+
+/**
+ * Keep listing rows (agents, ping receipts), in the given order, until the
+ * character budget is spent. `reservedChars` leaves room for the fields around
+ * the list. The first row always returns so a reader can always make progress.
+ */
+export function fitRows<T>(
+  rows: T[],
+  maxChars = DEFAULT_PAGE_CHARS,
+  reservedChars = 0,
+): { rows: T[]; omitted: number } {
+  const budget = Math.min(Math.max(maxChars, 1_000), MAX_PAGE_CHARS) - reservedChars;
+  const kept: T[] = [];
+  let used = 0;
+  for (const row of rows) {
+    const size = renderedChars(row);
+    if (kept.length > 0 && used + size > budget) break;
+    kept.push(row);
+    used += size;
+  }
+  return { rows: kept, omitted: rows.length - kept.length };
+}
+
 export function clampLimit(limit: number | undefined, fallback = DEFAULT_PAGE_LIMIT): number {
   return Math.min(Math.max(Math.trunc(limit ?? fallback), 1), MAX_PAGE_LIMIT);
 }

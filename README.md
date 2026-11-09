@@ -41,7 +41,7 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 - Direct messages, broadcasts, stable thread IDs and idempotency keys
 - Recipient-scoped acknowledgements, an outbox of what others have not handled, and agent retirement that closes finished work with a recorded reason
 - Recipient checks: unknown names are rejected with "did you mean" suggestions, and senders get warnings when a message is unlikely to be picked up
-- Output paging so large inboxes and threads never overflow an MCP result
+- Output paging so large inboxes, threads, agent lists and ping histories never overflow an MCP result
 - Optional background pings with delivery receipts, a 24-hour window for busy recipients and automatic notices to the sender when a ping fails
 - Codex workers with the sandbox pinned on every turn, read-only reviews, bridge-observed file changes and background completion through the mailbox
 - Worktrees outside your repository, with an option to carry uncommitted changes in
@@ -59,10 +59,10 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 | `bridge_wait` | Keep the current turn open until a matching message arrives |
 | `bridge_thread` | Read a thread, newest page first, with cursors both ways |
 | `bridge_outbox` | See which of your messages recipients have not handled, and why |
-| `bridge_agents` | List agents with unread counts, last activity and ping health |
+| `bridge_agents` | List agents, most recently active first, with unread counts and ping health; paged and searchable |
 | `bridge_retire` | Retire a finished agent and close its unhandled messages |
 | `bridge_sessions` | Discover live Claude sessions and this conversation's own session |
-| `bridge_wake_status` | Inspect ping outcomes separately from acknowledgements |
+| `bridge_wake_status` | Inspect ping outcomes separately from acknowledgements, newest first, in pages |
 | `ask_codex` | Send one bounded task to a Codex worker in an isolated worktree |
 | `review_with_codex` | Run an evidence-led review in a read-only sandbox |
 | `bridge_orchestrate_codex` | Start a Codex run with rounds, worktree and wait controls |

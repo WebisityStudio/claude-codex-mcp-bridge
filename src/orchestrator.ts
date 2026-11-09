@@ -107,6 +107,8 @@ export interface StartOrchestrationInput {
   includeUncommitted?: boolean;
   /** How long this call waits for the turn before returning running_codex. */
   waitMs?: number;
+  /** Aborted when the caller cancels or disconnects; the result then goes to the mailbox. */
+  signal?: AbortSignal;
 }
 
 export interface OrchestrationResult {
@@ -751,10 +753,15 @@ export class Orchestrator {
     });
     const baseline = sandbox === "read-only" ? await this.workspace.changes(prepared.path) : null;
     await this.launch(runId, basePrompt(input.task, { sandbox, warnings: prepared.warnings }), null, baseline);
-    return this.awaitResult(runId, input.waitMs ?? DEFAULT_WAIT_MS);
+    return this.awaitResult(runId, input.waitMs ?? DEFAULT_WAIT_MS, input.signal);
   }
 
-  async continueWithFable(runId: string, answer: string, waitMs = DEFAULT_WAIT_MS): Promise<OrchestrationResult> {
+  async continueWithFable(
+    runId: string,
+    answer: string,
+    waitMs = DEFAULT_WAIT_MS,
+    signal?: AbortSignal,
+  ): Promise<OrchestrationResult> {
     const run = this.store.getRun(runId);
     if (!run) throw new Error(`Unknown orchestration run: ${runId}`);
     if (run.status !== "waiting_for_fable") {
@@ -774,13 +781,13 @@ export class Orchestrator {
     this.store.appendRunEvent(runId, "fable_answer", { round: run.round + 1, answer });
     const baseline = run.sandboxMode === "read-only" ? await this.workspace.changes(run.worktreePath) : null;
     await this.launch(runId, continuationPrompt(answer), run.codexSessionId, baseline);
-    return this.awaitResult(runId, waitMs);
+    return this.awaitResult(runId, waitMs, signal);
   }
 
   /** Bounded wait for a run started by this or any other bridge process. */
-  async wait(runId: string, waitMs = DEFAULT_WAIT_MS): Promise<OrchestrationResult> {
+  async wait(runId: string, waitMs = DEFAULT_WAIT_MS, signal?: AbortSignal): Promise<OrchestrationResult> {
     if (!this.store.getRun(runId)) throw new Error(`Unknown orchestration run: ${runId}`);
-    return this.awaitResult(runId, waitMs);
+    return this.awaitResult(runId, waitMs, signal);
   }
 
   status(runId: string) {
@@ -900,23 +907,36 @@ export class Orchestrator {
     return true;
   }
 
-  private async awaitResult(runId: string, waitMs: number): Promise<OrchestrationResult> {
+  private async awaitResult(runId: string, waitMs: number, signal?: AbortSignal): Promise<OrchestrationResult> {
     const deadline = Date.now() + Math.min(Math.max(waitMs, 0), MAX_WAIT_MS);
     const local = this.active.get(runId);
-    if (local && deadline > Date.now()) {
+    if (local && deadline > Date.now() && !signal?.aborted) {
       const timer = new AbortController();
-      await Promise.race([local, sleep(deadline - Date.now(), undefined, { signal: timer.signal }).catch(() => {})]);
-      timer.abort();
+      const stop = () => timer.abort();
+      signal?.addEventListener("abort", stop, { once: true });
+      try {
+        await Promise.race([local, sleep(deadline - Date.now(), undefined, { signal: timer.signal }).catch(() => {})]);
+      } finally {
+        timer.abort();
+        signal?.removeEventListener("abort", stop);
+      }
     }
     const pollMs = this.options.pollMs ?? 500;
-    while (Date.now() < deadline && this.store.getRun(runId)?.status === "running_codex") {
-      await sleep(Math.min(pollMs, Math.max(deadline - Date.now(), 1)));
+    while (!signal?.aborted && Date.now() < deadline && this.store.getRun(runId)?.status === "running_codex") {
+      await sleep(Math.min(pollMs, Math.max(deadline - Date.now(), 1)), undefined, { signal }).catch(() => {});
     }
     const run = this.store.getRun(runId) as OrchestrationRun;
     if (run.status === "running_codex") {
       return this.resultFromRun(run, {
         summary: "Codex is still working.",
         next: `The result will be posted to ${run.coordinatorAgent}'s mailbox from "bridge" on thread ${JSON.stringify(run.threadId)} (a bound coordinator is pinged). You can also call bridge_orchestration_wait with this runId. Do not start a duplicate run.`,
+      });
+    }
+    if (signal?.aborted) {
+      // Nobody receives this return value. Leave the round unclaimed so the
+      // result is posted to the coordinator's mailbox instead of vanishing.
+      return this.resultFromRun(run, {
+        next: `This call was cancelled, so the result is posted to ${run.coordinatorAgent}'s mailbox from "bridge".`,
       });
     }
     const claimed = this.store.claimRunDelivery(runId, run.round);
