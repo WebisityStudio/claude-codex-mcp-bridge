@@ -11,6 +11,7 @@ export const CLI_COMMANDS = [
   "prune",
   "backup",
   "rollback",
+  "policy",
   "uninstall",
   "help",
 ] as const;
@@ -163,14 +164,12 @@ export function newestVersion(versions: string[]): string | null {
  * The Claude Code CLI used to register the server. A stale standalone
  * `claude` on PATH rewrites ~/.claude.json with its own older migration
  * marker, so prefer CLAUDE_BIN, then the newest build bundled with the
- * Claude desktop app, then PATH.
+ * Claude desktop app, then PATH. `bundled` is that newest build's path when
+ * one exists (see claude-binary.ts, which knows the app's folder layouts).
  */
-export function resolveClaudeBinary(input: { configured?: string; bundledRoot?: string; bundledVersions?: string[] }): string {
+export function resolveClaudeBinary(input: { configured?: string; bundled?: string | null }): string {
   if (input.configured?.trim()) return input.configured;
-  const newest = input.bundledRoot ? newestVersion(input.bundledVersions ?? []) : null;
-  return newest && input.bundledRoot
-    ? join(input.bundledRoot, newest, "claude.app", "Contents", "MacOS", "claude")
-    : "claude";
+  return input.bundled || "claude";
 }
 
 export const NODE_VERSION_REQUIREMENT = "Node.js 22.x >=22.23.4, 24.x >=24.22.1, or 26.x >=26.12.1";

@@ -22,6 +22,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 import { BridgeStore } from "./bridge-store.js";
+import { claudeBinaryPath } from "./claude-binary.js";
 import { claudeSessions } from "./claude-wake.js";
 import { codexConfigPath, readCodexServerEntry, updateCodexServerEntry } from "./codex-config.js";
 import { crossSessionInbound, inspectDatabase } from "./diagnostics.js";
@@ -51,21 +52,21 @@ import {
   NODE_VERSION_REQUIREMENT,
   buildRegistrationPlan,
   parseCliCommand,
-  resolveClaudeBinary,
   resolveSkillTargets,
   supportedNode,
   type ParsedCliCommand,
 } from "./cli-logic.js";
 import { VERSION } from "./version.js";
+import { loadPolicy, policyPath } from "./worker-policy.js";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const layout = runtimeLayout(runtimePrefix());
 const stableRoot = currentPackageRoot(layout);
 const stableServer = serverPathFor(stableRoot);
 const dbPath = defaultDbPath();
-const SKILLS = ["ask-codex", "review-with-codex", "claude-codex-coordinator"];
+const SKILLS = ["ask-codex", "ask-claude", "review-with-codex", "claude-codex-coordinator"];
 const DESKTOP_SKILL = "desktop-coordinator"; // Claude Code tab tools are not available in Codex.
-const REQUIRED_TOOLS = ["bridge_register", "bridge_send", "bridge_inbox", "bridge_outbox", "ask_codex", "bridge_orchestration_wait"];
+const REQUIRED_TOOLS = ["bridge_register", "bridge_send", "bridge_inbox", "bridge_outbox", "ask_codex", "ask_claude", "bridge_orchestration_wait"];
 const DAY_MS = 24 * 3_600_000;
 
 interface CommandResult {
@@ -93,19 +94,7 @@ function execute(argv: string[]): CommandResult {
 
 /** Prefer CLAUDE_BIN, then the newest Claude Code bundled with the desktop app, then PATH. */
 function claudeBinary(): string {
-  const bundledRoot =
-    process.platform === "darwin" ? join(homedir(), "Library", "Application Support", "Claude", "claude-code") : undefined;
-  let bundledVersions: string[] = [];
-  if (bundledRoot) {
-    try {
-      bundledVersions = readdirSync(bundledRoot).filter((version) =>
-        existsSync(join(bundledRoot, version, "claude.app", "Contents", "MacOS", "claude")),
-      );
-    } catch {
-      // No desktop app installed.
-    }
-  }
-  return resolveClaudeBinary({ configured: process.env.CLAUDE_BIN, bundledRoot, bundledVersions });
+  return claudeBinaryPath();
 }
 
 function nodeVersion(binary: string): string | null {
@@ -456,6 +445,26 @@ async function doctor(parsed: ParsedCliCommand): Promise<number> {
   const codexVersion = execute([codexBinary, "--version"]);
   add(codexVersion.ok ? "ok" : "warn", "Codex CLI", codexVersion.ok ? `${codexVersion.output} (${codexBinary})` : `${codexBinary} is not runnable; set CODEX_BIN`);
 
+  // ask_claude runs the Claude Code CLI on its own; the desktop app's sign-in does not cover it.
+  const signIn = execute([claudeCli, "auth", "status"]);
+  let signedIn: boolean | null = null;
+  try {
+    signedIn = (JSON.parse(signIn.output) as { loggedIn?: boolean }).loggedIn === true;
+  } catch {
+    // An older CLI or unexpected output: say so rather than guess.
+  }
+  if (signedIn === true) add("ok", "Claude CLI sign-in", "signed in; ask_claude can start Claude worker chats");
+  else if (signedIn === false) add("warn", "Claude CLI sign-in", "not signed in; ask_claude needs `claude auth login` once (the desktop app's sign-in does not cover the CLI)");
+  else add("info", "Claude CLI sign-in", "could not be checked; ask_claude needs the CLI signed in");
+
+  try {
+    const loaded = loadPolicy();
+    const limits = loaded.policy;
+    add("ok", "Worker policy", `${loaded.source ?? "built-in defaults"}: ${limits.maxStartsPerHour} chats/hour, Codex up to ${limits.codex.maxSandbox} and ${limits.codex.maxEffort}, Claude up to ${limits.claude.maxPermissionMode} and ${limits.claude.maxEffort}`);
+  } catch (error) {
+    add("fail", "Worker policy", error instanceof Error ? error.message : String(error));
+  }
+
   const report = inspectDatabase(dbPath);
   if (!report.exists) add("info", "Mailbox", `${dbPath} not created yet`);
   else if (report.error) add("fail", "Mailbox", report.error);
@@ -592,6 +601,25 @@ function backup(): number {
   }
 }
 
+function policy(): number {
+  const path = policyPath();
+  console.log(`Claude Codex MCP Bridge ${VERSION} worker policy\n`);
+  try {
+    const loaded = loadPolicy(path);
+    console.log(loaded.source ? `In force: ${loaded.source}` : `In force: built-in defaults (no file at ${path})`);
+    console.log(JSON.stringify(loaded.policy, null, 2));
+    console.log(
+      loaded.source
+        ? "\nEdit that file to change a limit. Agents cannot change it through the bridge."
+        : `\nTo change a limit, save the JSON above as ${path} and edit it. Agents cannot change it through the bridge.`,
+    );
+    return 0;
+  } catch (error) {
+    console.error(`✗ ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+}
+
 function rollback(): number {
   const current = currentVersion(layout);
   const previous = previousVersion(listVersions(layout), current);
@@ -682,6 +710,7 @@ Commands:
                                   List agents idle for DAYS (default 7); --apply retires them
   backup                          Write a point-in-time copy of the mailbox
   rollback                        Switch back to the previous installed runtime
+  policy                          Show the ceiling for worker chats and where to change it
   uninstall [--purge]             Remove registrations, runtimes and skills
   help                            Show this help
 
@@ -706,6 +735,7 @@ async function main(): Promise<void> {
       prune: () => prune(parsed),
       backup,
       rollback,
+      policy,
       uninstall: () => uninstall(parsed),
       help,
     };

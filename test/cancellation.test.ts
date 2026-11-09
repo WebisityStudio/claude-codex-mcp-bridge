@@ -265,7 +265,8 @@ test("a cancelled review_with_codex call still delivers its result to the coordi
   git("add", ".");
   git("commit", "-q", "-m", "initial");
 
-  const client = await connect("cancelled-run", join(dir, "bridge.sqlite"), { CODEX_BIN: binary });
+  // The stand-in speaks `codex exec`, which also exercises the fallback runner end to end.
+  const client = await connect("cancelled-run", join(dir, "bridge.sqlite"), { CODEX_BIN: binary, BRIDGE_CODEX_RUNNER: "exec" });
   try {
     await call(client, "bridge_register", { agent: "lead" });
     const caller = new AbortController();

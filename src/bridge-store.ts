@@ -984,6 +984,14 @@ export class BridgeStore {
     return rows.map((row) => ({ app: row.app, state: row.state, count: Number(row.n) }));
   }
 
+  /** Worker chats started since a point in time, by every bridge process sharing this mailbox. */
+  countRunsSince(sinceIso: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM orchestration_runs WHERE created_at >= ?")
+      .get(sinceIso) as { n: number | bigint };
+    return Number(row.n);
+  }
+
   runCounts(): Record<string, number> {
     const rows = this.db
       .prepare("SELECT status, COUNT(*) AS n FROM orchestration_runs GROUP BY status")

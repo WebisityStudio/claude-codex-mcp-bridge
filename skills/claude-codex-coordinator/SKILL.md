@@ -11,13 +11,13 @@ Use this for work that needs more than one question or review.
 
 ## Simple delegation
 
-Prefer `ask_codex` or `review_with_codex` when one bounded call is enough.
+Prefer `ask_codex` or `review_with_codex` when one bounded call is enough. `ask_claude` does the same with a new Claude Code chat.
 
 ## Autonomous implementation
 
 1. Call `bridge_orchestrate_codex` with one canonical thread ID. Keep worktree isolation on for implementation, and pass `includeUncommitted: true` when Codex must see uncommitted edits.
 2. If the status is `running_codex`, continue other work. The result arrives in the coordinator's mailbox from `bridge`, or call `bridge_orchestration_wait` with the run ID. Never start a duplicate run.
-3. If the status is `waiting_for_fable`, answer the precise question and immediately call `bridge_continue_codex` with the same run ID.
+3. If the status is `waiting_for_fable`, answer the precise question and immediately call `bridge_continue_run` with the same run ID.
 4. Continue until completed, blocked, failed or the round limit is reached. Check `observedChanges` against Codex's report before calling the work done.
 
 ## Two existing app conversations

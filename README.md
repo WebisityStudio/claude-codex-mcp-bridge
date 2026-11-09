@@ -43,7 +43,10 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 - Recipient checks: unknown names are rejected with "did you mean" suggestions, and senders get warnings when a message is unlikely to be picked up
 - Output paging so large inboxes, threads, agent lists and ping histories never overflow an MCP result
 - Optional background pings with delivery receipts, a 24-hour window for busy recipients and automatic notices to the sender when a ping fails
-- Codex workers with the sandbox pinned on every turn, read-only reviews, bridge-observed file changes and background completion through the mailbox
+- Worker chats in either app: Codex workers with the sandbox pinned on every turn, and Claude Code workers in a chosen permission mode, each with a chosen model and reasoning effort
+- An owner-set ceiling for what agents may choose and how many worker chats they may start
+- Codex worker chats that appear in the Codex app, and Claude worker chats that can be opened in the Claude desktop app
+- Read-only reviews, bridge-observed file changes and background completion through the mailbox
 - Worktrees outside your repository, with an option to carry uncommitted changes in
 - Recovery of Codex runs whose bridge process exited mid-turn
 - A versioned runtime with smoke-tested installs and one-command rollback
@@ -63,11 +66,13 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 | `bridge_retire` | Retire a finished agent and close its unhandled messages |
 | `bridge_sessions` | Discover live Claude sessions and this conversation's own session |
 | `bridge_wake_status` | Inspect ping outcomes separately from acknowledgements, newest first, in pages |
-| `ask_codex` | Send one bounded task to a Codex worker in an isolated worktree |
+| `ask_codex` | Send one bounded task to a new Codex chat in an isolated worktree, with an optional model, reasoning effort and sandbox |
+| `ask_claude` | Send one bounded task to a new Claude Code chat, with an optional model, reasoning effort and permission mode |
 | `review_with_codex` | Run an evidence-led review in a read-only sandbox |
 | `bridge_orchestrate_codex` | Start a Codex run with rounds, worktree and wait controls |
-| `bridge_continue_codex` | Resume the same Codex session with the coordinator's answer |
-| `bridge_orchestration_wait` | Wait for a running Codex run started by any bridge process |
+| `bridge_continue_run` | Resume the same worker chat (Codex or Claude) with the coordinator's answer |
+| `bridge_continue_codex` | Earlier name of `bridge_continue_run`, kept for existing callers |
+| `bridge_orchestration_wait` | Wait for a running worker run started by any bridge process |
 | `bridge_orchestration_status` | Read durable run state and audit events |
 
 ## Requirements
@@ -77,7 +82,7 @@ See [INSTRUCTIONS.md](INSTRUCTIONS.md) for copy-paste prompts.
 - OpenAI Codex CLI
 - Git, for worktree isolation
 
-The mailbox works anywhere Node and both MCP clients run. The Codex launcher uses `CODEX_BIN` when set, then the Codex binary bundled in the macOS ChatGPT app, then `codex` from `PATH`.
+The mailbox works anywhere Node and both MCP clients run. The Codex launcher uses `CODEX_BIN` when set, then the Codex binary bundled in the macOS ChatGPT app, then `codex` from `PATH`. Claude workers and registration use `CLAUDE_BIN` when set, then the newest Claude Code bundled with the Claude desktop app, then `claude` from `PATH`; `ask_claude` also needs that CLI signed in once with `claude auth login`, because the desktop app's sign-in does not cover it.
 
 These Node.js minimum versions include the [October 21, 2026 security fixes](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases). Setup and `doctor` reject older versions, prereleases and other major release lines. Later stable patches and minor releases within 22.x, 24.x and 26.x are accepted; a patched 26.12.1 installation can stay on that line.
 
@@ -190,11 +195,47 @@ Most MCP hosts cut tool calls near five minutes, so waits are capped at 290 seco
 - Worktrees live under `~/.local/share/claude-codex-bridge/worktrees/` (or `BRIDGE_WORKTREE_ROOT`). They stay out of your repository, so Metro, `tsc`, Jest and `git status` never see them.
 - Worktrees start from `HEAD`. When the main checkout has uncommitted changes, the result warns you; pass `includeUncommitted: true` to copy them in.
 - Every result includes `observedChanges`, the bridge's own `git status` of the workspace, next to what Codex reports.
-- If the status is `waiting_for_fable`, answer the question and call `bridge_continue_codex` with the same run ID.
+- If the status is `waiting_for_fable`, answer the question and call `bridge_continue_run` with the same run ID.
 - Codex turns run as detached processes. If the bridge process that started one exits, another bridge process adopts the run, finishes it from its files and delivers the result.
 - `BRIDGE_CODEX_CONFIG` can tune bridge workers without touching your interactive defaults, for example `model_reasoning_effort="medium"`. Sandbox and approval keys are ignored.
 
 The bridge does not commit, push, merge, deploy or clean worktrees.
+
+## Worker chats, visibility and the ceiling
+
+An agent in one app can start a new chat in the other, or in its own, and choose how it runs:
+
+| | `ask_codex`, `review_with_codex`, `bridge_orchestrate_codex` | `ask_claude` |
+|---|---|---|
+| Model | `model` | `model` (a name or an alias such as `haiku`) |
+| Reasoning | `reasoningEffort` | `effort` |
+| Access | `sandbox`: `read-only` or `workspace-write`, network off | `permissionMode`: `plan` or `manual` (read only), `acceptEdits` (edit files in a worktree), `auto` |
+| Where you see it | In the Codex app's chat list; the result's `appLink` (`codex://threads/<id>`) opens it | In the Claude desktop app when `showInDesktop` is set |
+
+- **Codex chats run through `codex app-server`**, the protocol the Codex apps use, so the app lists them. The turn still runs in a detached background process, not live in the app, and the app does not treat the chat as its own until you open it. Set `BRIDGE_CODEX_RUNNER=exec` to return to `codex exec`, whose sessions the app does not list.
+- **Claude chats run through headless Claude Code** without MCP servers. When `showInDesktop` is set and the chat has finished, the bridge runs `claude --desktop --resume <session>` in a pseudo-terminal (macOS), and the desktop app switches to the chat. Elsewhere, or if that step fails, the result carries the command to run by hand.
+- **Full access is never offered.** Workers cannot be given Codex's `danger-full-access` sandbox or Claude's bypass-permissions mode through the bridge.
+- **The bridge does not use the Codex app's wake link** to make the app run a queued message. In testing the app ran such a chat with its own default model and permissions, not the ones requested.
+
+### The ceiling
+
+The bridge cannot see how much the agent that calls it is allowed to do, so the owner sets a ceiling and agents choose inside it. Without a file the defaults below apply. To change them, save this as `policy.json` in the bridge's data directory (`claude-codex-mcp-bridge policy` prints the effective policy and the path):
+
+```json
+{
+  "maxStartsPerHour": 12,
+  "allowedRoots": [],
+  "codex": { "allowedModels": [], "maxEffort": "high", "maxSandbox": "workspace-write" },
+  "claude": { "allowedModels": [], "maxEffort": "high", "maxPermissionMode": "acceptEdits", "showInDesktop": "on-request" }
+}
+```
+
+- `maxStartsPerHour` counts Codex and Claude worker chats together, across every session sharing the mailbox.
+- `allowedRoots` limits the folders a worker may be started in; an empty list means any folder.
+- `allowedModels` limits the models an agent may name; an empty list means any model.
+- `showInDesktop` is `never`, `on-request` (only when the tool call asks) or `always`.
+
+A request above the ceiling is refused with the limit named; nothing is lowered silently. No tool can change the policy, and a policy file that cannot be read is an error rather than a fall-back to the defaults. Any local process that can edit files can still edit this one, so it is a guard against agents asking for too much, not a security boundary.
 
 ## Input and repository preparation limits
 
@@ -260,7 +301,7 @@ npm audit --omit=dev --audit-level=high
 BRIDGE_CODEX_CONFIG='model_reasoning_effort="low"' npm run smoke:orchestrator   # live Codex run, fully isolated
 ```
 
-The suite covers socket framing, identity and permission boundaries, migrations from 0.3 databases and compatibility with running 0.3 processes, ping persistence, crash recovery and failure notices, mailbox routing, addressing checks, retirement, paging, independent MCP processes, detached Codex turns with a fake Codex binary, orphaned run recovery, real git worktrees, Codex config edits and runtime rollback.
+The suite covers worker policy limits, Codex app-server and headless Claude turns against stand-in CLIs, the desktop hand-off, socket framing, identity and permission boundaries, migrations from 0.3 databases and compatibility with running 0.3 processes, ping persistence, crash recovery and failure notices, mailbox routing, addressing checks, retirement, paging, independent MCP processes, detached Codex turns with a fake Codex binary, orphaned run recovery, real git worktrees, Codex config edits and runtime rollback.
 
 The tracked `npm-shrinkwrap.json` records dependency versions and integrity hashes in place of `package-lock.json`. `npm ci` reads it for checkout installs, and npm includes it in the package so setup's installed runtime uses the same locked production dependency versions. Refresh this lockfile deliberately when updating dependencies.
 

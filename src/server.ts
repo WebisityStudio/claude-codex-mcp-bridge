@@ -8,18 +8,29 @@ import { z } from "zod";
 import { agentNameProblem, checkRecipient } from "./addressing.js";
 import { BridgeStore } from "./bridge-store.js";
 import { CHANNEL_CAPABILITY, channelSession } from "./claude-channel.js";
+import { showInClaudeDesktop } from "./claude-desktop.js";
+import { CLAUDE_EFFORTS, ClaudeCliRunner } from "./claude-runner.js";
 import { claudeSessions } from "./claude-wake.js";
+import { CodexAppServerRunner } from "./codex-app-runner.js";
 import { Housekeeper } from "./housekeeping.js";
 import { waitForInbox } from "./inbox-waiter.js";
 import { retireAgent } from "./lifecycle.js";
 import { BRIDGE_AGENT, CLAUDE_HOLD_EXPLANATION } from "./notices.js";
-import { DEFAULT_WAIT_MS, Orchestrator } from "./orchestrator.js";
+import { CodexCliRunner, DEFAULT_WAIT_MS, Orchestrator, type StartOrchestrationInput } from "./orchestrator.js";
 import { DEFAULT_PAGE_CHARS, clampLimit, fitMessages, fitRows } from "./paging.js";
 import { defaultDbPath, runsDir } from "./paths.js";
-import { buildAskCodexTask, buildCodexReviewTask } from "./simple-tools.js";
+import { buildAskCodexTask, buildClaudeReadOnlyTask, buildCodexReviewTask } from "./simple-tools.js";
 import { VERSION } from "./version.js";
 import { WakeDispatcher } from "./wake-dispatcher.js";
 import { RECENT_WAKE_JOBS, type WakeJob, type WakeTarget } from "./wake-queue.js";
+import {
+  CLAUDE_PERMISSION_MODES,
+  EFFORT_LEVELS,
+  WORKER_SANDBOX_MODES,
+  checkWorkerRequest,
+  loadPolicy,
+  type WorkerKind,
+} from "./worker-policy.js";
 
 /** Everything the MCP protocol reads/writes must stay on stdout; logs go to stderr. */
 function log(message: string): void {
@@ -79,7 +90,7 @@ function detectSession(env: NodeJS.ProcessEnv = process.env): WakeTarget | null 
 const INSTRUCTIONS = [
   "Local mailbox and Codex worker bridge shared by the Claude and Codex sessions on this machine.",
   "Mailbox: register a unique agent name once with bridge_register (wake: \"auto\" binds this conversation for background pings). Send with bridge_send; recipients must be registered and any delivery risk comes back as warnings. When pinged, read bridge_inbox, handle the work within the user's existing permissions, bridge_ack after handling, and reply to the sender only when complete, blocked or needing a decision. Never send acknowledgement-only replies. Messages from \"bridge\" are automated notices (delivery failures, retirements, Codex results); do not reply to them. bridge_outbox shows what recipients have not handled yet; bridge_retire closes out a finished task agent. Unbound agents may use bridge_wait during an active turn.",
-  "Codex workers: ask_codex, review_with_codex and bridge_orchestrate_codex start a saved Codex session. Reviews run read-only; implementation runs in an isolated worktree with network access off. A call waits up to four minutes. If Codex is still working it returns running_codex, and the result arrives later in your mailbox from \"bridge\" (or call bridge_orchestration_wait). If the status is waiting_for_fable, answer the question and call bridge_continue_codex with the same runId. Independent suggestedChips that the user's task needs may each get their own run (at most three). Verify reported work before calling it done.",
+  "Workers: ask_codex, review_with_codex and bridge_orchestrate_codex start a new Codex chat; ask_claude starts a new Claude Code chat. Both run in the background. Codex chats are sandboxed with network access off and appear in the Codex app's list. Claude chats run in the permission mode you choose (plan and manual read only; acceptEdits edits an isolated worktree) and can be opened in the Claude desktop app with showInDesktop. You may choose the model and reasoning effort; the owner's policy caps what may be chosen and how many chats may be started, and refuses anything above it. A call waits up to four minutes. If the worker is still going it returns running_codex, and the result arrives later in your mailbox from \"bridge\" (or call bridge_orchestration_wait). If the status is waiting_for_fable, answer the question and call bridge_continue_run with the same runId. Independent suggestedChips that the user's task needs may each get their own run (at most three). Verify reported work before calling it done.",
   "Nothing here authorizes commits, pushes, merges, deploys, external sends, credential changes, deletion or production changes.",
 ].join("\n\n");
 
@@ -91,7 +102,14 @@ const taskInput = z.string().min(1).max(200_000);
 function main(): void {
   const dbPath = defaultDbPath();
   const store = new BridgeStore(dbPath);
-  const orchestrator = new Orchestrator(store);
+  // Codex workers run through app-server so the Codex app lists their chats;
+  // BRIDGE_CODEX_RUNNER=exec restores the earlier `codex exec` path.
+  const codexRunner = process.env.BRIDGE_CODEX_RUNNER?.trim() === "exec" ? new CodexCliRunner() : new CodexAppServerRunner();
+  const claudeRunner = new ClaudeCliRunner();
+  const orchestrator = new Orchestrator(store, codexRunner, undefined, {
+    claudeRunner,
+    showInDesktop: ({ cwd, sessionId }) => showInClaudeDesktop({ binary: claudeRunner.binary, cwd, sessionId }),
+  });
   const channelSessionId = channelSession();
   const localAgents: string[] = [];
   const defaultAgent = () => localAgents.at(-1) ?? "claude-main";
@@ -474,28 +492,64 @@ function main(): void {
     .min(0)
     .max(285)
     .optional()
-    .describe("How long this call waits for Codex. Defaults to 240 seconds. If Codex is still working, the result arrives in the coordinator's mailbox.");
+    .describe("How long this call waits for the worker. Defaults to 240 seconds. If it is still working, the result arrives in the coordinator's mailbox.");
   const waitMs = (seconds: number | undefined) => (seconds === undefined ? DEFAULT_WAIT_MS : seconds * 1000);
+  const projectInput = z.string().min(1).max(4096).optional();
+  const coordinatorInput = agentInput.optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main.");
+  const modelInput = z.string().min(1).max(120).optional();
+  const CEILING = "The owner's policy.json sets what may be chosen; a request above it is refused with the limit named.";
+
+  /** A recognisable name for the chat in the app's own list, from the first line of the request. */
+  const chatTitle = (text: string) => {
+    const line = text.split("\n").map((part) => part.trim()).find(Boolean) ?? "worker chat";
+    return `Bridge: ${line.replace(/\s+/g, " ").slice(0, 60)}`;
+  };
+
+  /** Check a request against the owner's ceiling, then start the worker chat. */
+  const startWorker = (
+    request: Omit<StartOrchestrationInput, "warnings" | "showInDesktop"> & { worker: WorkerKind; showInDesktop?: boolean },
+  ) => {
+    const { policy, source } = loadPolicy();
+    const decision = checkWorkerRequest(
+      policy,
+      {
+        worker: request.worker,
+        projectPath: request.projectPath,
+        model: request.model,
+        effort: request.effort,
+        sandbox: request.worker === "codex" ? request.sandbox : undefined,
+        permissionMode: request.permissionMode,
+        showInDesktop: request.showInDesktop,
+        startsLastHour: store.countRunsSince(new Date(Date.now() - 3_600_000).toISOString()),
+      },
+      source,
+    );
+    return orchestrator.start({ ...request, showInDesktop: decision.showInDesktop, warnings: decision.warnings });
+  };
 
   server.registerTool(
     "ask_codex",
     {
       title: "Ask Codex",
       description:
-        "Send one bounded implementation, investigation, or verification task to a saved Codex worker in an isolated worktree. This is the simple everyday entry point; no mailbox or thread management is required.",
+        `Send one bounded implementation, investigation, or verification task to a new Codex worker chat in an isolated worktree. This is the simple everyday entry point; no mailbox or thread management is required. The chat appears in the Codex app's list (appLink opens it) but runs in the background, sandboxed with network access off. Optionally choose the model, reasoning effort and sandbox. ${CEILING}`,
       inputSchema: {
-        projectPath: z.string().min(1).max(4096).optional().describe("Absolute path to the repository. Defaults to this session's project directory."),
+        projectPath: projectInput.describe("Absolute path to the repository. Defaults to this session's project directory."),
         request: taskInput.describe("What Codex should do."),
-        coordinatorAgent: agentInput.optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
+        coordinatorAgent: coordinatorInput,
         threadId: threadInput.optional().describe("Optional stable task ID. Generated when omitted."),
         useWorktree: z.boolean().optional().describe("Use an isolated Git worktree. Defaults true."),
         includeUncommitted: z.boolean().optional().describe("Copy the main checkout's uncommitted changes into the worktree."),
+        model: modelInput.describe("Codex model for this chat. Defaults to Codex's own default."),
+        reasoningEffort: z.enum(EFFORT_LEVELS).optional().describe("Reasoning effort. Defaults to the model's own default."),
+        sandbox: z.enum(WORKER_SANDBOX_MODES).optional().describe("read-only cannot change files; workspace-write (the default) can change files in the workspace."),
         waitSeconds,
       },
     },
-    async ({ projectPath, request, coordinatorAgent, threadId, useWorktree, includeUncommitted, waitSeconds: seconds }, extra) =>
+    async ({ projectPath, request, coordinatorAgent, threadId, useWorktree, includeUncommitted, model, reasoningEffort, sandbox, waitSeconds: seconds }, extra) =>
       jsonResult(
-        await orchestrator.start({
+        await startWorker({
+          worker: "codex",
           coordinatorAgent: coordinatorAgent ?? defaultAgent(),
           projectPath: projectPath ?? projectFallback(),
           task: buildAskCodexTask(request),
@@ -503,6 +557,10 @@ function main(): void {
           useWorktree: useWorktree ?? true,
           includeUncommitted,
           maxRounds: 4,
+          model,
+          effort: reasoningEffort,
+          sandbox,
+          title: chatTitle(request),
           waitMs: waitMs(seconds),
           signal: callerGone(extra),
         }),
@@ -514,18 +572,21 @@ function main(): void {
     {
       title: "Review with Codex",
       description:
-        "Ask Codex for a read-only repository review with evidence and actionable findings. Codex runs in a read-only sandbox and the bridge reports whether the workspace changed.",
+        `Ask Codex for a read-only repository review with evidence and actionable findings. Codex runs in a read-only sandbox and the bridge reports whether the workspace changed. Optionally choose the model and reasoning effort. ${CEILING}`,
       inputSchema: {
-        projectPath: z.string().min(1).max(4096).optional().describe("Absolute path to the repository. Defaults to this session's project directory."),
+        projectPath: projectInput.describe("Absolute path to the repository. Defaults to this session's project directory."),
         focus: z.string().max(200_000).optional().describe("Optional review focus, such as security, a PR, or a subsystem."),
-        coordinatorAgent: agentInput.optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
+        coordinatorAgent: coordinatorInput,
         threadId: threadInput.optional().describe("Optional stable task ID. Generated when omitted."),
+        model: modelInput.describe("Codex model for this chat. Defaults to Codex's own default."),
+        reasoningEffort: z.enum(EFFORT_LEVELS).optional().describe("Reasoning effort. Defaults to the model's own default."),
         waitSeconds,
       },
     },
-    async ({ projectPath, focus, coordinatorAgent, threadId, waitSeconds: seconds }, extra) =>
+    async ({ projectPath, focus, coordinatorAgent, threadId, model, reasoningEffort, waitSeconds: seconds }, extra) =>
       jsonResult(
-        await orchestrator.start({
+        await startWorker({
+          worker: "codex",
           coordinatorAgent: coordinatorAgent ?? defaultAgent(),
           projectPath: projectPath ?? projectFallback(),
           task: buildCodexReviewTask(focus),
@@ -533,6 +594,9 @@ function main(): void {
           useWorktree: false,
           sandbox: "read-only",
           maxRounds: 1,
+          model,
+          effort: reasoningEffort,
+          title: chatTitle(focus?.trim() ? `Review: ${focus}` : "Repository review"),
           waitMs: waitMs(seconds),
           signal: callerGone(extra),
         }),
@@ -544,21 +608,25 @@ function main(): void {
     {
       title: "Start an autonomous Codex implementation run",
       description:
-        "Start a saved Codex worker in an isolated git worktree (network off) and wait up to waitSeconds for its structured result. If status is waiting_for_fable, answer the question and call bridge_continue_codex. If it is running_codex, the result arrives in the coordinator's mailbox. Independent calls create separate runs. This tool never grants permission to commit, push, deploy, publish, send externally, change credentials, delete data, or mutate production.",
+        `Start a Codex worker chat in an isolated git worktree (network off) and wait up to waitSeconds for its structured result. If status is waiting_for_fable, answer the question and call bridge_continue_run. If it is running_codex, the result arrives in the coordinator's mailbox. Independent calls create separate runs. Optionally choose the model, reasoning effort and sandbox. ${CEILING} This tool never grants permission to commit, push, deploy, publish, send externally, change credentials, delete data, or mutate production.`,
       inputSchema: {
-        coordinatorAgent: agentInput.optional().describe("Agent that receives the result. Defaults to this conversation's registered agent, else claude-main."),
-        projectPath: z.string().min(1).max(4096).optional().describe("Absolute path to the git repository. Defaults to this session's project directory."),
+        coordinatorAgent: coordinatorInput,
+        projectPath: projectInput.describe("Absolute path to the git repository. Defaults to this session's project directory."),
         task: taskInput.describe("Self-contained implementation or verification task."),
         threadId: threadInput.describe("Stable task/thread identifier."),
         useWorktree: z.boolean().optional().describe("Create an isolated git worktree. Defaults true."),
         includeUncommitted: z.boolean().optional().describe("Copy the main checkout's uncommitted changes into the worktree."),
         maxRounds: z.number().int().min(1).max(12).optional().describe("Maximum coordinator/Codex turns. Defaults 6."),
+        model: modelInput.describe("Codex model for this chat. Defaults to Codex's own default."),
+        reasoningEffort: z.enum(EFFORT_LEVELS).optional().describe("Reasoning effort. Defaults to the model's own default."),
+        sandbox: z.enum(WORKER_SANDBOX_MODES).optional().describe("read-only cannot change files; workspace-write (the default) can change files in the workspace."),
         waitSeconds,
       },
     },
-    async ({ coordinatorAgent, projectPath, task, threadId, useWorktree, includeUncommitted, maxRounds, waitSeconds: seconds }, extra) =>
+    async ({ coordinatorAgent, projectPath, task, threadId, useWorktree, includeUncommitted, maxRounds, model, reasoningEffort, sandbox, waitSeconds: seconds }, extra) =>
       jsonResult(
-        await orchestrator.start({
+        await startWorker({
+          worker: "codex",
           coordinatorAgent: coordinatorAgent ?? defaultAgent(),
           projectPath: projectPath ?? projectFallback(),
           task,
@@ -566,6 +634,10 @@ function main(): void {
           useWorktree: useWorktree ?? true,
           includeUncommitted,
           maxRounds: maxRounds ?? 6,
+          model,
+          effort: reasoningEffort,
+          sandbox,
+          title: chatTitle(task),
           waitMs: waitMs(seconds),
           signal: callerGone(extra),
         }),
@@ -573,14 +645,75 @@ function main(): void {
   );
 
   server.registerTool(
+    "ask_claude",
+    {
+      title: "Ask Claude",
+      description:
+        `Send one bounded task to a new Claude Code worker chat that runs in the background. Choose the model, reasoning effort and permission mode: plan and manual cannot change files and read the real checkout; acceptEdits (the default) edits files in an isolated git worktree; auto decides for itself. showInDesktop opens the finished chat in the Claude desktop app, which switches to it. ${CEILING} Workers run without MCP servers and need the Claude Code CLI signed in (claude auth login). If status is waiting_for_fable, answer the question and call bridge_continue_run. Nothing here grants permission to commit, push, deploy, publish, send externally, change credentials, delete data, or mutate production.`,
+      inputSchema: {
+        projectPath: projectInput.describe("Absolute path to the repository. Defaults to this session's project directory."),
+        request: taskInput.describe("What Claude should do."),
+        coordinatorAgent: coordinatorInput,
+        threadId: threadInput.optional().describe("Optional stable task ID. Generated when omitted."),
+        model: modelInput.describe("Claude model or alias, e.g. 'haiku', 'sonnet', 'opus'. Defaults to Claude Code's own default."),
+        effort: z.enum(CLAUDE_EFFORTS).optional().describe("Reasoning effort. Defaults to the model's own default."),
+        permissionMode: z.enum(CLAUDE_PERMISSION_MODES).optional().describe("plan or manual: read only. acceptEdits (default): may edit files in the workspace. auto: decides for itself."),
+        useWorktree: z.boolean().optional().describe("Use an isolated Git worktree. Defaults true for acceptEdits and auto, false for plan and manual."),
+        includeUncommitted: z.boolean().optional().describe("Copy the main checkout's uncommitted changes into the worktree."),
+        showInDesktop: z.boolean().optional().describe("Open the finished chat in the Claude desktop app. The app switches to it, so ask only when the user wants to see it."),
+        waitSeconds,
+      },
+    },
+    async ({ projectPath, request, coordinatorAgent, threadId, model, effort, permissionMode, useWorktree, includeUncommitted, showInDesktop, waitSeconds: seconds }, extra) => {
+      const mode = permissionMode ?? "acceptEdits";
+      const readOnly = mode === "plan" || mode === "manual";
+      return jsonResult(
+        await startWorker({
+          worker: "claude",
+          coordinatorAgent: coordinatorAgent ?? defaultAgent(),
+          projectPath: projectPath ?? projectFallback(),
+          task: readOnly ? buildClaudeReadOnlyTask(request) : buildAskCodexTask(request),
+          threadId: threadId ?? `ask-claude-${randomUUID()}`,
+          useWorktree: useWorktree ?? !readOnly,
+          includeUncommitted,
+          maxRounds: 4,
+          model,
+          effort,
+          permissionMode: mode,
+          showInDesktop,
+          title: chatTitle(request),
+          waitMs: waitMs(seconds),
+          signal: callerGone(extra),
+        }),
+      );
+    },
+  );
+
+  server.registerTool(
+    "bridge_continue_run",
+    {
+      title: "Continue a worker with the coordinator's answer",
+      description:
+        "Resume the exact saved worker chat (Codex or Claude) and workspace after the worker asked for a decision (status waiting_for_fable). The model, sandbox or permission mode from the first turn are kept. Continue until completed, blocked, failed, or the round limit is reached.",
+      inputSchema: {
+        runId: z.string().uuid().describe("Run ID returned by the tool that started the worker."),
+        answer: taskInput.describe("The coordinator's concrete answer to the worker's question."),
+        waitSeconds,
+      },
+    },
+    async ({ runId, answer, waitSeconds: seconds }, extra) =>
+      jsonResult(await orchestrator.continueWithFable(runId, answer, waitMs(seconds), callerGone(extra))),
+  );
+
+  server.registerTool(
     "bridge_continue_codex",
     {
       title: "Continue Codex with the coordinator's answer",
       description:
-        "Resume the exact saved Codex session and worktree after Codex asked for a decision (status waiting_for_fable). The sandbox from the first turn is kept. Continue until completed, blocked, failed, or the round limit is reached.",
+        "Earlier name of bridge_continue_run, kept for existing callers: resume the exact saved worker chat and workspace after it asked for a decision (status waiting_for_fable). The sandbox from the first turn is kept.",
       inputSchema: {
         runId: z.string().uuid().describe("Run ID returned by the orchestration tool."),
-        fableAnswer: taskInput.describe("The coordinator's concrete answer to Codex's question."),
+        fableAnswer: taskInput.describe("The coordinator's concrete answer to the worker's question."),
         waitSeconds,
       },
     },
@@ -591,8 +724,8 @@ function main(): void {
   server.registerTool(
     "bridge_orchestration_wait",
     {
-      title: "Wait for a Codex run",
-      description: "Wait up to timeoutSeconds for a running Codex run to finish its current round, then return its result. Works for runs started by any bridge process.",
+      title: "Wait for a worker run",
+      description: "Wait up to timeoutSeconds for a running Codex or Claude worker run to finish its current round, then return its result. Works for runs started by any bridge process.",
       inputSchema: {
         runId: z.string().uuid().describe("Orchestration run ID."),
         timeoutSeconds: z.number().int().min(0).max(285).optional().describe("Defaults to 240 seconds."),

@@ -495,6 +495,23 @@ test("worktrees live outside the repository and can carry uncommitted changes", 
   assert.equal(readFileSync(join(nested.path, "keep.txt"), "utf8"), "sub\n");
 });
 
+test("a worker can be started in a plain folder, but only a git repository can have a worktree", async () => {
+  const folder = realpathSync(mkdtempSync(join(tmpdir(), "bridge-plain-folder-")));
+  const manager = new GitWorkspaceManager(join(folder, "worktrees"));
+  const run = { runId: "99999999-0000-4000-8000-000000000000", threadId: "plain" };
+
+  const plain = await manager.prepare({ projectPath: folder, useWorktree: false, ...run });
+  assert.deepEqual([plain.path, plain.branch, plain.baseCommit, plain.uncommitted.length], [folder, null, null, 0]);
+  assert.match(plain.warnings[0] ?? "", /not a git repository, so the bridge cannot report which files changed/);
+  assert.equal(await manager.changes(folder), null);
+
+  await assert.rejects(
+    manager.prepare({ projectPath: folder, useWorktree: true, ...run }),
+    /is not a git repository, so it cannot have an isolated worktree\. Pass useWorktree: false/,
+  );
+  await assert.rejects(manager.prepare({ projectPath: join(folder, "missing"), useWorktree: false, ...run }), /projectPath is not a folder/);
+});
+
 test("Git preparation never runs repository hooks, fsmonitor, diff or conversion helpers", { skip: process.platform === "win32" }, async () => {
   const base = realpathSync(mkdtempSync(join(tmpdir(), "bridge-git-helpers-")));
   const repo = join(base, "repo");

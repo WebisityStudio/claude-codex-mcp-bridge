@@ -29,6 +29,7 @@ import { ensurePrivateDirectory } from "./fs-safety.js";
 import { BRIDGE_AGENT } from "./notices.js";
 import { runsDir, worktreeRoot } from "./paths.js";
 import { isProcessAlive, processStartTime, terminateProcessTree } from "./process-info.js";
+import type { ClaudePermissionMode, WorkerKind } from "./worker-policy.js";
 
 export type { SandboxMode } from "./bridge-store.js";
 
@@ -53,6 +54,14 @@ export interface CodexTurnRequest {
   /** Resume this saved session, or start a new one when null. */
   sessionId: string | null;
   sandbox: SandboxMode;
+  /** The model the caller chose, or null for the app's default. */
+  model?: string | null;
+  /** The reasoning effort the caller chose, or null for the model's default. */
+  effort?: string | null;
+  /** Claude workers: the permission mode for this turn. */
+  permissionMode?: ClaudePermissionMode | null;
+  /** A short name for the chat, shown in the app's own list. */
+  title?: string | null;
 }
 
 export interface TurnHooks {
@@ -63,11 +72,15 @@ export interface TurnHooks {
 export interface TurnOutcome {
   sessionId: string;
   response: CodexTurnResponse;
+  /** What the runner itself noticed, such as tool calls the permission mode refused. */
+  warnings?: string[];
 }
 
 export interface CodexRunner {
   /** Longest a single turn may run before it is stopped. */
   readonly turnTimeoutMs: number;
+  /** True when the app lists chats this runner starts, so `codex://threads/<id>` opens them. */
+  readonly listedInApp?: boolean;
   run(request: CodexTurnRequest, hooks?: TurnHooks): Promise<TurnOutcome>;
   /** Finish a turn from its files after the process that launched it exited. */
   recover?(files: TurnFiles, knownSessionId: string | null): TurnOutcome;
@@ -109,6 +122,37 @@ export interface StartOrchestrationInput {
   waitMs?: number;
   /** Aborted when the caller cancels or disconnects; the result then goes to the mailbox. */
   signal?: AbortSignal;
+  /** Which app runs the worker chat. Defaults to Codex. */
+  worker?: WorkerKind;
+  /** The caller's choices, already checked against the owner's policy. */
+  model?: string;
+  effort?: string;
+  /** Claude workers: plan and manual cannot change files; acceptEdits and auto can. */
+  permissionMode?: ClaudePermissionMode;
+  /** Claude workers: open the finished chat in the Claude desktop app. */
+  showInDesktop?: boolean;
+  /** A short name for the chat in the app's own list. */
+  title?: string;
+  /** Notes from the policy check to carry in the result. */
+  warnings?: string[];
+}
+
+/** What a run was started with; kept in its first event so later rounds use the same. */
+interface WorkerSettings {
+  worker: WorkerKind;
+  model: string | null;
+  effort: string | null;
+  permissionMode: ClaudePermissionMode | null;
+  showInDesktop: boolean;
+  title: string | null;
+}
+
+/** The outcome of opening a finished Claude chat in the desktop app. */
+export interface DesktopHandoffResult {
+  shown: boolean;
+  detail: string;
+  /** What to run in a terminal, in the chat's folder, to open it by hand. */
+  manualCommand: string;
 }
 
 export interface OrchestrationResult {
@@ -131,13 +175,27 @@ export interface OrchestrationResult {
   observedChanges: string[] | null;
   warnings: string[];
   next?: string;
+  /** Which app ran the worker chat. */
+  worker: WorkerKind;
+  /** The worker chat's own ID in that app (the same value as codexSessionId, whichever app ran it). */
+  sessionId: string | null;
+  /** The model and effort the caller chose; absent means the app's defaults. */
+  model?: string;
+  effort?: string;
+  /** Claude workers: the permission mode the chat ran in. */
+  permissionMode?: ClaudePermissionMode;
+  /** Codex workers started through app-server: a link that opens the chat in the Codex app. */
+  appLink?: string;
+  /** Claude workers: whether the finished chat was opened in the desktop app. */
+  desktop?: DesktopHandoffResult;
 }
 
 /** Stay below the ~5 minute limit common MCP hosts apply to one tool call. */
 export const DEFAULT_WAIT_MS = 240_000;
 export const MAX_WAIT_MS = 285_000;
 
-const CODEX_OUTPUT_SCHEMA = {
+/** The envelope every worker turn answers with, whichever app runs it. */
+export const CODEX_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
@@ -199,15 +257,24 @@ export function buildSafeEnvironment(
 export interface ResolveCodexBinaryInput {
   platform?: NodeJS.Platform;
   configuredBinary?: string;
-  bundledMacExists?: boolean;
+  /** Test seam: which bundled paths exist. Defaults to the file system. */
+  exists?: (path: string) => boolean;
 }
+
+/**
+ * Where the macOS ChatGPT app has shipped its Codex CLI, newest layout first.
+ * Using the app's own copy keeps worker chats in the format the app reads.
+ */
+export const BUNDLED_CODEX_PATHS = [
+  "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+  "/Applications/ChatGPT.app/Contents/Resources/codex",
+] as const;
 
 export function resolveCodexBinary(input: ResolveCodexBinaryInput = {}): string {
   if (input.configuredBinary?.trim()) return input.configuredBinary;
-  const platform = input.platform ?? process.platform;
-  const bundled = "/Applications/ChatGPT.app/Contents/Resources/codex";
-  const bundledMacExists = input.bundledMacExists ?? (platform === "darwin" && existsSync(bundled));
-  return bundledMacExists ? bundled : "codex";
+  if ((input.platform ?? process.platform) !== "darwin") return "codex";
+  const exists = input.exists ?? existsSync;
+  return BUNDLED_CODEX_PATHS.find((path) => exists(path)) ?? "codex";
 }
 
 /** Config keys a worker override may never change: they carry the safety boundary. */
@@ -240,24 +307,36 @@ export function buildCodexArgs(input: {
   outputPath: string;
   schemaPath: string;
   extraConfig?: string[];
+  model?: string | null;
+  effort?: string | null;
 }): string[] {
   const config = [
     ...(input.extraConfig ?? []).flatMap((entry) => ["-c", entry]),
-    "-c",
-    'approval_policy="never"',
-    "-c",
-    `sandbox_mode="${input.sandbox}"`,
+    ...pinnedCodexConfig(input),
   ];
-  if (input.sandbox === "workspace-write") {
-    config.push("-c", "sandbox_workspace_write.network_access=false");
-  }
   const output = ["--json", "-o", input.outputPath, "--output-schema", input.schemaPath];
   return input.sessionId
     ? ["exec", "resume", ...config, ...output, input.sessionId, "-"]
     : ["exec", "--sandbox", input.sandbox, ...config, ...output, "-"];
 }
 
-function validateResponse(value: unknown): CodexTurnResponse {
+/**
+ * `-c` overrides every Codex worker turn carries, whichever way it is started.
+ * The caller's model and effort come first; the safety values come last so
+ * nothing earlier on the command line can replace them.
+ */
+export function pinnedCodexConfig(input: { sandbox: SandboxMode; model?: string | null; effort?: string | null }): string[] {
+  const config: string[] = [];
+  if (input.model) config.push("-c", `model=${JSON.stringify(input.model)}`);
+  if (input.effort) config.push("-c", `model_reasoning_effort=${JSON.stringify(input.effort)}`);
+  config.push("-c", 'approval_policy="never"', "-c", `sandbox_mode="${input.sandbox}"`);
+  if (input.sandbox === "workspace-write") {
+    config.push("-c", "sandbox_workspace_write.network_access=false");
+  }
+  return config;
+}
+
+export function validateResponse(value: unknown): CodexTurnResponse {
   if (!value || typeof value !== "object") throw new Error("Codex response is not an object");
   const item = value as Record<string, unknown>;
   if (!(["completed", "needs_fable", "blocked"] as unknown[]).includes(item.status)) {
@@ -288,7 +367,7 @@ function readHead(path: string, bytes: number): string {
   }
 }
 
-function readTail(path: string, bytes: number): string {
+export function readTail(path: string, bytes: number): string {
   try {
     const size = statSync(path).size;
     const fd = openSync(path, "r");
@@ -319,31 +398,46 @@ export function readSessionId(eventsPath: string): string | null {
   return null;
 }
 
-/**
- * Runs Codex turns as detached processes that write to files. If the MCP
- * process exits mid-turn, Codex keeps working and any bridge process can
- * finish the run from those files.
- */
-export class CodexCliRunner implements CodexRunner {
-  private readonly binary: string;
-  private readonly dataDir: string;
-  private readonly schemaPath: string;
-  private readonly extraConfig: string[];
-  readonly turnTimeoutMs: number;
+export interface DetachedCommand {
+  command: string;
+  args: string[];
+}
 
-  constructor(options: { binary?: string; dataDir?: string; timeoutMs?: number; extraConfig?: string[] } = {}) {
-    this.binary = resolveCodexBinary({ configuredBinary: options.binary ?? process.env.CODEX_BIN });
-    this.extraConfig = options.extraConfig ?? parseExtraCodexConfig(process.env.BRIDGE_CODEX_CONFIG);
+/**
+ * Runs one worker turn as a detached process that writes to files. If the MCP
+ * process exits mid-turn, the worker keeps going and any bridge process can
+ * finish the run from those files. Subclasses say which process to start and
+ * how to read its result.
+ */
+export abstract class DetachedTurnRunner implements CodexRunner {
+  protected readonly dataDir: string;
+  readonly turnTimeoutMs: number;
+  /** Named in errors, e.g. "Codex" or "Claude". */
+  protected readonly label: string = "Codex";
+
+  constructor(options: { dataDir?: string; timeoutMs?: number } = {}) {
     this.dataDir = options.dataDir ?? runsDir();
     const configuredMinutes = Number(process.env.BRIDGE_CODEX_TURN_TIMEOUT_MINUTES);
     this.turnTimeoutMs =
       options.timeoutMs ??
       (Number.isFinite(configuredMinutes) && configuredMinutes > 0 ? configuredMinutes * 60_000 : 20 * 60_000);
     ensurePrivateDirectory(this.dataDir);
-    this.schemaPath = join(this.dataDir, "codex-turn.schema.json");
-    writeFileSync(this.schemaPath, `${JSON.stringify(CODEX_OUTPUT_SCHEMA, null, 2)}\n`, {
-      mode: 0o600,
-    });
+  }
+
+  /** The process for one turn. It reads the prompt on stdin; its stdout becomes the events file. */
+  protected abstract command(request: CodexTurnRequest, files: TurnFiles, sessionId: string | null): DetachedCommand;
+
+  /** Read a finished turn from its files. `exitCode` is null when another process is recovering it. */
+  protected abstract collect(files: TurnFiles, knownSessionId: string | null, exitCode: number | null): TurnOutcome;
+
+  /** A session ID chosen before a new worker starts, for workers that accept one. */
+  protected newSessionId(): string | null {
+    return null;
+  }
+
+  /** The session ID the worker has reported so far. */
+  protected reportedSessionId(files: TurnFiles): string | null {
+    return readSessionId(files.eventsPath);
   }
 
   async run(request: CodexTurnRequest, hooks: TurnHooks = {}): Promise<TurnOutcome> {
@@ -353,26 +447,18 @@ export class CodexCliRunner implements CodexRunner {
       eventsPath: join(this.dataDir, `${id}.events.jsonl`),
       stderrPath: join(this.dataDir, `${id}.stderr.log`),
     };
+    const sessionId = request.sessionId ?? this.newSessionId();
+    const { command, args } = this.command(request, files, sessionId);
     const eventsFd = openSync(files.eventsPath, "w", 0o600);
     const stderrFd = openSync(files.stderrPath, "w", 0o600);
     let child;
     try {
-      child = spawn(
-        this.binary,
-        buildCodexArgs({
-          sessionId: request.sessionId,
-          sandbox: request.sandbox,
-          outputPath: files.outputPath,
-          schemaPath: this.schemaPath,
-          extraConfig: this.extraConfig,
-        }),
-        {
-          cwd: request.cwd,
-          env: buildSafeEnvironment(),
-          stdio: ["pipe", eventsFd, stderrFd],
-          detached: process.platform !== "win32",
-        },
-      );
+      child = spawn(command, args, {
+        cwd: request.cwd,
+        env: buildSafeEnvironment(),
+        stdio: ["pipe", eventsFd, stderrFd],
+        detached: process.platform !== "win32",
+      });
     } finally {
       closeSync(eventsFd);
       closeSync(stderrFd);
@@ -388,13 +474,14 @@ export class CodexCliRunner implements CodexRunner {
     hooks.onSpawn?.({ pid: child.pid ?? null, started: await processStartTime(child.pid), files });
 
     let reported = request.sessionId;
-    const watch = setInterval(() => {
-      const sessionId = readSessionId(files.eventsPath);
-      if (sessionId && sessionId !== reported) {
-        reported = sessionId;
-        hooks.onSession?.(sessionId);
+    const report = (seen: string | null) => {
+      if (seen && seen !== reported) {
+        reported = seen;
+        hooks.onSession?.(seen);
       }
-    }, 500);
+    };
+    report(sessionId);
+    const watch = setInterval(() => report(this.reportedSessionId(files)), 500);
     watch.unref();
     let deadline: NodeJS.Timeout | undefined;
     try {
@@ -403,11 +490,12 @@ export class CodexCliRunner implements CodexRunner {
         new Promise<never>((_, reject) => {
           deadline = setTimeout(() => {
             if (child.pid) terminateProcessTree(child.pid);
-            reject(new Error(`Codex turn timed out after ${Math.round(this.turnTimeoutMs / 60_000)} minutes`));
+            reject(new Error(`${this.label} turn timed out after ${Math.round(this.turnTimeoutMs / 60_000)} minutes`));
           }, this.turnTimeoutMs);
         }),
       ]);
-      return this.collect(files, request.sessionId, code);
+      report(this.reportedSessionId(files)); // A fast turn can finish between two looks.
+      return this.collect(files, sessionId, code);
     } finally {
       clearInterval(watch);
       clearTimeout(deadline);
@@ -417,15 +505,60 @@ export class CodexCliRunner implements CodexRunner {
   recover(files: TurnFiles, knownSessionId: string | null): TurnOutcome {
     return this.collect(files, knownSessionId, null);
   }
+}
 
-  private collect(files: TurnFiles, knownSessionId: string | null, exitCode: number | null): TurnOutcome {
-    if (exitCode !== null && exitCode !== 0) {
-      throw new Error(`Codex exited ${exitCode}: ${readTail(files.stderrPath, 4000) || "no diagnostic output"}`);
-    }
-    const sessionId = readSessionId(files.eventsPath) ?? knownSessionId;
-    if (!sessionId) throw new Error("Codex did not report a session ID");
-    if (!existsSync(files.outputPath)) throw new Error("Codex did not write its final response");
-    return { sessionId, response: validateResponse(JSON.parse(readFileSync(files.outputPath, "utf8"))) };
+/** Write the envelope schema every Codex worker turn must answer with; returns its path. */
+export function writeTurnSchema(dataDir: string): string {
+  const path = join(dataDir, "codex-turn.schema.json");
+  writeFileSync(path, `${JSON.stringify(CODEX_OUTPUT_SCHEMA, null, 2)}\n`, { mode: 0o600 });
+  return path;
+}
+
+/** Read a Codex turn's result: the session from the event stream, the envelope from the output file. */
+export function collectCodexTurn(files: TurnFiles, knownSessionId: string | null, exitCode: number | null): TurnOutcome {
+  if (exitCode !== null && exitCode !== 0) {
+    throw new Error(`Codex exited ${exitCode}: ${readTail(files.stderrPath, 4000) || "no diagnostic output"}`);
+  }
+  const sessionId = readSessionId(files.eventsPath) ?? knownSessionId;
+  if (!sessionId) throw new Error("Codex did not report a session ID");
+  if (!existsSync(files.outputPath)) throw new Error("Codex did not write its final response");
+  return { sessionId, response: validateResponse(JSON.parse(readFileSync(files.outputPath, "utf8"))) };
+}
+
+/**
+ * Codex turns through `codex exec`. These sessions are saved but the Codex
+ * app does not list them; `CodexAppServerRunner` is the default for that
+ * reason, and this runner remains as the fallback (BRIDGE_CODEX_RUNNER=exec).
+ */
+export class CodexCliRunner extends DetachedTurnRunner {
+  private readonly binary: string;
+  private readonly schemaPath: string;
+  private readonly extraConfig: string[];
+
+  constructor(options: { binary?: string; dataDir?: string; timeoutMs?: number; extraConfig?: string[] } = {}) {
+    super(options);
+    this.binary = resolveCodexBinary({ configuredBinary: options.binary ?? process.env.CODEX_BIN });
+    this.extraConfig = options.extraConfig ?? parseExtraCodexConfig(process.env.BRIDGE_CODEX_CONFIG);
+    this.schemaPath = writeTurnSchema(this.dataDir);
+  }
+
+  protected command(request: CodexTurnRequest, files: TurnFiles): DetachedCommand {
+    return {
+      command: this.binary,
+      args: buildCodexArgs({
+        sessionId: request.sessionId,
+        sandbox: request.sandbox,
+        outputPath: files.outputPath,
+        schemaPath: this.schemaPath,
+        extraConfig: this.extraConfig,
+        model: request.model,
+        effort: request.effort,
+      }),
+    };
+  }
+
+  protected collect(files: TurnFiles, knownSessionId: string | null, exitCode: number | null): TurnOutcome {
+    return collectCodexTurn(files, knownSessionId, exitCode);
   }
 }
 
@@ -553,7 +686,23 @@ export class GitWorkspaceManager implements WorkspaceManager {
 
   async prepare(input: PrepareInput): Promise<PreparedWorkspace> {
     if (!isAbsolute(input.projectPath)) throw new Error("projectPath must be absolute");
-    const top = await runGit(input.projectPath, ["rev-parse", "--show-toplevel"]);
+    const folder = statSync(input.projectPath, { throwIfNoEntry: false });
+    if (!folder?.isDirectory()) throw new Error(`projectPath is not a folder: ${input.projectPath}`);
+    const top = await runGit(input.projectPath, ["rev-parse", "--show-toplevel"]).catch(() => null);
+    if (top === null) {
+      // A worker can still be started in a plain folder; only the worktree and the change report need git.
+      if (input.useWorktree) {
+        throw new Error(`${input.projectPath} is not a git repository, so it cannot have an isolated worktree. Pass useWorktree: false to work in the folder itself.`);
+      }
+      return {
+        path: input.projectPath,
+        branch: null,
+        baseCommit: null,
+        uncommitted: [],
+        includedUncommitted: true,
+        warnings: [`${input.projectPath} is not a git repository, so the bridge cannot report which files changed.`],
+      };
+    }
     const baseCommit = await runGit(top, ["rev-parse", "--verify", "HEAD"]).catch(() => null);
     const uncommitted = (await this.changes(top)) ?? [];
     if (!input.useWorktree) {
@@ -630,19 +779,29 @@ export class GitWorkspaceManager implements WorkspaceManager {
   }
 }
 
-function basePrompt(task: string, context: { sandbox: SandboxMode; warnings: string[] }): string {
+const WORKER_LABEL: Record<WorkerKind, string> = { codex: "Codex", claude: "Claude" };
+
+function basePrompt(task: string, context: { sandbox: SandboxMode; warnings: string[]; worker?: WorkerKind }): string {
+  const claude = context.worker === "claude";
   const workspace =
     context.sandbox === "read-only"
-      ? "- Your sandbox is read-only. Inspect files and run read-only commands; do not try to edit anything."
-      : "- Work only inside the supplied workspace. Network access is disabled.";
+      ? claude
+        ? "- This chat cannot change files. Inspect files and run read-only commands; do not try to edit anything."
+        : "- Your sandbox is read-only. Inspect files and run read-only commands; do not try to edit anything."
+      : claude
+        ? "- Work only inside the supplied workspace."
+        : "- Work only inside the supplied workspace. Network access is disabled.";
   const notes = context.warnings.length
     ? `\n\nWORKSPACE NOTES:\n${context.warnings.map((warning) => `- ${warning}`).join("\n")}`
     : "";
-  return `You are a Codex worker coordinated by a Claude session through claude-codex-bridge.\n\nTASK:\n${task}${notes}\n\nSAFETY BOUNDARY:\n${workspace}\n- Do not commit, push, merge, deploy, publish, send external messages, change credentials/configuration, delete data, or perform production mutations.\n- If any such action is required, return status blocked and explain exactly what approval is needed.\n- Run relevant tests and report real evidence.\n- If a hard architecture/reasoning decision needs the coordinator, return needs_fable with one precise question. Do not guess.\n- You may suggest up to three independent child chips, but do not launch them yourself.\n- Return only the required JSON envelope.`;
+  const role = claude
+    ? "You are a Claude Code worker started by another agent session through claude-codex-bridge."
+    : "You are a Codex worker coordinated by a Claude session through claude-codex-bridge.";
+  return `${role}\n\nTASK:\n${task}${notes}\n\nSAFETY BOUNDARY:\n${workspace}\n- Do not commit, push, merge, deploy, publish, send external messages, change credentials/configuration, delete data, or perform production mutations.\n- If any such action is required, return status blocked and explain exactly what approval is needed.\n- Run relevant tests and report real evidence.\n- If a hard architecture/reasoning decision needs the coordinator, return needs_fable with one precise question. Do not guess.\n- You may suggest up to three independent child chips, but do not launch them yourself.\n- Return only the required JSON envelope.`;
 }
 
 function continuationPrompt(answer: string): string {
-  return `The coordinating Claude session answered your question:\n\n${answer}\n\nContinue the original task in the same workspace. Keep the same safety boundary. Run verification and return only the required JSON envelope. If another genuinely hard question remains, return needs_fable again.`;
+  return `The coordinating session answered your question:\n\n${answer}\n\nContinue the original task in the same workspace. Keep the same safety boundary. Run verification and return only the required JSON envelope. If another genuinely hard question remains, return needs_fable again.`;
 }
 
 function list(items: string[] | null | undefined, max = 12): string {
@@ -653,25 +812,35 @@ function list(items: string[] | null | undefined, max = 12): string {
 
 /** The mailbox message a coordinator receives when a background run finishes a round. */
 export function runResultMessage(result: OrchestrationResult, threadId: string): string {
+  const who = WORKER_LABEL[result.worker ?? "codex"];
   const lines = [
-    `Codex run ${result.runId} (thread ${JSON.stringify(threadId)}) finished round ${result.round} of ${result.maxRounds}: ${result.status}.`,
+    `${who} run ${result.runId} (thread ${JSON.stringify(threadId)}) finished round ${result.round} of ${result.maxRounds}: ${result.status}.`,
     `Summary: ${result.summary}`,
   ];
   if (result.status === "waiting_for_fable" && result.question) {
     lines.push(
-      `Codex asks: ${result.question}`,
-      `Answer with bridge_continue_codex {"runId": "${result.runId}", "fableAnswer": "..."}.`,
+      `${who} asks: ${result.question}`,
+      `Answer with bridge_continue_run {"runId": "${result.runId}", "answer": "..."}.`,
     );
   }
   lines.push(
-    `Files changed (reported by Codex): ${list(result.filesChanged)}`,
+    `Files changed (reported by ${who}): ${list(result.filesChanged)}`,
     `Workspace changes (observed by the bridge): ${list(result.observedChanges)}`,
     `Tests: ${list(result.tests, 6)}`,
     `Evidence: ${list(result.evidence, 6)}`,
   );
   if (result.warnings.length) lines.push(`Warnings: ${list(result.warnings, 6)}`);
+  const access = result.permissionMode ? `Permission mode: ${result.permissionMode}` : `Sandbox: ${result.sandbox}`;
+  lines.push(`Workspace: ${result.worktreePath}${result.branch ? ` (branch ${result.branch})` : ""}. ${access}.`);
+  if (result.appLink) lines.push(`The chat is in the Codex app's list; ${result.appLink} opens it.`);
+  if (result.desktop) {
+    lines.push(
+      result.desktop.shown
+        ? "The chat was opened in the Claude desktop app."
+        : `The chat was not opened in the Claude desktop app (${result.desktop.detail}). In a terminal in the workspace: ${result.desktop.manualCommand}`,
+    );
+  }
   lines.push(
-    `Workspace: ${result.worktreePath}${result.branch ? ` (branch ${result.branch})` : ""}. Sandbox: ${result.sandbox}.`,
     `Full details: bridge_orchestration_status {"runId": "${result.runId}"}. Verify the work before reporting it as done. This is an automated bridge message.`,
   );
   return lines.join("\n\n");
@@ -680,6 +849,7 @@ export function runResultMessage(result: OrchestrationResult, threadId: string):
 interface Observed {
   observedChanges: string[] | null;
   warnings: string[];
+  desktop?: DesktopHandoffResult;
 }
 
 export interface OrchestratorOptions {
@@ -687,6 +857,10 @@ export interface OrchestratorOptions {
   deliveryDelayMs?: number;
   /** How often a waiter polls a run owned by another process. */
   pollMs?: number;
+  /** Runs Claude worker chats. Without it, Claude workers are refused. */
+  claudeRunner?: CodexRunner;
+  /** Opens a finished Claude chat in the desktop app. Without it, the manual command is reported. */
+  showInDesktop?: (chat: { cwd: string; sessionId: string }) => Promise<DesktopHandoffResult>;
 }
 
 export class Orchestrator {
@@ -715,8 +889,12 @@ export class Orchestrator {
       throw new Error("maxRounds must be between 1 and 12");
     }
 
+    const worker = input.worker ?? "codex";
+    this.runnerFor(worker); // Refuse a worker this bridge cannot run before anything is created.
     const runId = randomUUID();
-    const sandbox = input.sandbox ?? "workspace-write";
+    // Claude's plan and manual modes cannot change files, so the bridge watches them like a read-only sandbox.
+    const readOnlyMode = worker === "claude" && (input.permissionMode === "plan" || input.permissionMode === "manual");
+    const sandbox = input.sandbox ?? (readOnlyMode ? "read-only" : "workspace-write");
     const prepared = await this.workspace.prepare({
       projectPath: input.projectPath,
       useWorktree: input.useWorktree,
@@ -749,11 +927,37 @@ export class Orchestrator {
       threadId: input.threadId,
       uncommittedChanges: prepared.uncommitted.length,
       includedUncommitted: prepared.includedUncommitted,
-      warnings: prepared.warnings,
+      warnings: [...prepared.warnings, ...(input.warnings ?? [])],
+      worker,
+      model: input.model ?? null,
+      effort: input.effort ?? null,
+      permissionMode: worker === "claude" ? input.permissionMode ?? "acceptEdits" : null,
+      showInDesktop: worker === "claude" && input.showInDesktop === true,
+      title: input.title ?? null,
     });
     const baseline = sandbox === "read-only" ? await this.workspace.changes(prepared.path) : null;
-    await this.launch(runId, basePrompt(input.task, { sandbox, warnings: prepared.warnings }), null, baseline);
+    await this.launch(runId, basePrompt(input.task, { sandbox, warnings: prepared.warnings, worker }), null, baseline);
     return this.awaitResult(runId, input.waitMs ?? DEFAULT_WAIT_MS, input.signal);
+  }
+
+  private runnerFor(worker: WorkerKind): CodexRunner {
+    if (worker === "codex") return this.runner;
+    if (!this.options.claudeRunner) throw new Error("This bridge process is not set up to run Claude workers.");
+    return this.options.claudeRunner;
+  }
+
+  /** What the run was started with. Runs created before worker settings existed are Codex runs. */
+  private settings(runId: string): WorkerSettings {
+    const created = this.store.runEvents(runId).find((event) => event.type === "created")?.payload ?? {};
+    const text = (value: unknown) => (typeof value === "string" && value ? value : null);
+    return {
+      worker: created.worker === "claude" ? "claude" : "codex",
+      model: text(created.model),
+      effort: text(created.effort),
+      permissionMode: text(created.permissionMode) as ClaudePermissionMode | null,
+      showInDesktop: created.showInDesktop === true,
+      title: text(created.title),
+    };
   }
 
   async continueWithFable(
@@ -767,15 +971,13 @@ export class Orchestrator {
     if (run.status !== "waiting_for_fable") {
       throw new Error(`Run ${runId} is not waiting for Fable (status: ${run.status})`);
     }
-    if (!run.codexSessionId) throw new Error(`Run ${runId} has no Codex session ID`);
+    if (!run.codexSessionId) throw new Error(`Run ${runId} has no saved worker session`);
     if (run.round >= run.maxRounds) {
-      const blocked = this.store.updateRun(runId, {
-        status: "blocked",
-        latestResponse: { summary: "Fable/Codex round limit reached" },
-      });
+      const summary = `Round limit reached: the coordinator and ${WORKER_LABEL[this.settings(runId).worker]} have used all ${run.maxRounds} rounds.`;
+      const blocked = this.store.updateRun(runId, { status: "blocked", latestResponse: { summary } });
       this.store.appendRunEvent(runId, "round_limit", { round: run.round, maxRounds: run.maxRounds });
       this.store.claimRunDelivery(runId, blocked.round);
-      return this.resultFromRun(blocked, { summary: "Fable/Codex round limit reached" });
+      return this.resultFromRun(blocked, { summary });
     }
 
     this.store.appendRunEvent(runId, "fable_answer", { round: run.round + 1, answer });
@@ -808,9 +1010,19 @@ export class Orchestrator {
       turnFiles: null,
       turnStartedAt: new Date().toISOString(),
     });
-    const settled = this.runner
+    const settings = this.settings(runId);
+    const settled = this.runnerFor(settings.worker)
       .run(
-        { cwd: run.worktreePath, prompt, sessionId, sandbox: run.sandboxMode },
+        {
+          cwd: run.worktreePath,
+          prompt,
+          sessionId,
+          sandbox: run.sandboxMode,
+          model: settings.model,
+          effort: settings.effort,
+          permissionMode: settings.permissionMode,
+          title: settings.title,
+        },
         {
           onSpawn: (info) =>
             this.store.updateRun(runId, { childPid: info.pid, childStarted: info.started, turnFiles: info.files }),
@@ -818,7 +1030,7 @@ export class Orchestrator {
         },
       )
       .then(
-        async (outcome) => this.applyTurn(runId, outcome.sessionId, outcome.response, await this.observe(runId, baseline)),
+        (outcome) => this.settle(runId, outcome, baseline),
         (error: unknown) => {
           this.fail(runId, error);
         },
@@ -829,6 +1041,32 @@ export class Orchestrator {
       })
       .finally(() => this.active.delete(runId));
     this.active.set(runId, settled);
+  }
+
+  /** Record a finished turn: what the workspace looks like, what the runner noticed, and the desktop hand-off. */
+  private async settle(runId: string, outcome: TurnOutcome, baseline: string[] | null, note?: string): Promise<void> {
+    const observed = await this.observe(runId, baseline);
+    observed.warnings.push(...(outcome.warnings ?? []));
+    if (note) observed.warnings.push(note);
+    const settings = this.settings(runId);
+    // A chat that is still waiting for an answer stays with the bridge; only a finished one is handed over.
+    if (settings.worker === "claude" && settings.showInDesktop && outcome.response.status !== "needs_fable") {
+      observed.desktop = await this.handOff(runId, outcome.sessionId);
+    }
+    this.applyTurn(runId, outcome.sessionId, outcome.response, observed);
+  }
+
+  private async handOff(runId: string, sessionId: string): Promise<DesktopHandoffResult> {
+    const run = this.store.getRun(runId) as OrchestrationRun;
+    const manualCommand = `claude --desktop --resume ${sessionId}`;
+    if (!this.options.showInDesktop) {
+      return { shown: false, detail: "This bridge process cannot open chats in the Claude desktop app.", manualCommand };
+    }
+    try {
+      return await this.options.showInDesktop({ cwd: run.worktreePath, sessionId });
+    } catch (error) {
+      return { shown: false, detail: error instanceof Error ? error.message : String(error), manualCommand };
+    }
   }
 
   private async observe(runId: string, baseline: string[] | null): Promise<Observed> {
@@ -866,6 +1104,7 @@ export class Orchestrator {
       suggestedChips: response.suggestedChips,
       observedChanges: observed.observedChanges,
       warnings: observed.warnings,
+      ...(observed.desktop ? { desktop: observed.desktop } : {}),
     });
   }
 
@@ -993,20 +1232,20 @@ export class Orchestrator {
   }
 
   private async finishOrphan(run: OrchestrationRun): Promise<void> {
+    const worker = this.settings(run.id).worker;
     try {
-      if (!run.turnFiles || !this.runner.recover) throw new Error("no turn output was recorded");
-      const outcome = this.runner.recover(run.turnFiles, run.codexSessionId);
-      const observed = await this.observe(run.id, null);
-      observed.warnings.push("Recovered after the bridge process that started this turn exited.");
-      this.applyTurn(run.id, outcome.sessionId, outcome.response, observed);
+      const runner = this.runnerFor(worker);
+      if (!run.turnFiles || !runner.recover) throw new Error("no turn output was recorded");
+      const outcome = runner.recover(run.turnFiles, run.codexSessionId);
+      await this.settle(run.id, outcome, null, "Recovered after the bridge process that started this turn exited.");
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      this.fail(run.id, new Error(`Codex turn was interrupted when its bridge process exited (${reason}). The workspace is preserved at ${run.worktreePath}.`));
+      this.fail(run.id, new Error(`${WORKER_LABEL[worker]} turn was interrupted when its bridge process exited (${reason}). The workspace is preserved at ${run.worktreePath}.`));
     }
     this.deliver(run.id);
   }
 
-  /** Stop background timers. Detached Codex turns keep running; another process adopts them. */
+  /** Stop background timers. Detached worker turns keep running; another process adopts them. */
   close(): void {
     this.closed = true;
     for (const runId of [...this.orphans.keys()]) this.stopWatching(runId);
@@ -1022,6 +1261,8 @@ export class Orchestrator {
     const created = this.store.runEvents(run.id).find((event) => event.type === "created");
     const setupWarnings = Array.isArray(created?.payload.warnings) ? (created.payload.warnings as string[]) : [];
     const running = run.status === "running_codex";
+    const settings = this.settings(run.id);
+    const listed = settings.worker === "codex" && this.runner.listedInApp === true && run.codexSessionId !== null;
     return {
       runId: run.id,
       status: run.status,
@@ -1041,6 +1282,13 @@ export class Orchestrator {
       observedChanges: running ? null : latest?.bridge?.observedChanges ?? null,
       warnings: [...setupWarnings, ...(running ? [] : latest?.bridge?.warnings ?? [])],
       ...(overrides.next ? { next: overrides.next } : {}),
+      worker: settings.worker,
+      sessionId: run.codexSessionId,
+      ...(settings.model ? { model: settings.model } : {}),
+      ...(settings.effort ? { effort: settings.effort } : {}),
+      ...(settings.permissionMode ? { permissionMode: settings.permissionMode } : {}),
+      ...(listed ? { appLink: `codex://threads/${run.codexSessionId}` } : {}),
+      ...(!running && latest?.bridge?.desktop ? { desktop: latest.bridge.desktop as DesktopHandoffResult } : {}),
     };
   }
 }

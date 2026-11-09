@@ -12,14 +12,17 @@ Open fresh Claude and Codex sessions after setup. If an update misbehaves, `clau
 
 ## Everyday requests
 
-The installer adds `/ask-codex`, `/review-with-codex`, `/claude-codex-coordinator` and a `codex-teammate` Claude agent. For Claude-to-Claude work in the desktop Code tab, use `/desktop-coordinator` and say explicitly to **start a separate local session now**. Keep the returned session ID for follow-ups. A suggested-task card is not a running worker.
+The installer adds `/ask-codex`, `/ask-claude`, `/review-with-codex`, `/claude-codex-coordinator` and a `codex-teammate` Claude agent. For Claude-to-Claude work in the desktop Code tab, use `/desktop-coordinator` and say explicitly to **start a separate local session now**. Keep the returned session ID for follow-ups. A suggested-task card is not a running worker.
 
 ```text
 /ask-codex implement the requested change and run the relevant tests
 /review-with-codex focus on security and regressions
+/ask-claude review the migration without changing anything, on the haiku model
 ```
 
-The project defaults to the current Claude session's project. If Codex is still working after about four minutes, the tool returns `running_codex`. The result arrives later in your mailbox from `bridge`. Carry on with other work; do not start a duplicate run.
+The project defaults to the current session's project. If the worker is still going after about four minutes, the tool returns `running_codex`. The result arrives later in your mailbox from `bridge`. Carry on with other work; do not start a duplicate run.
+
+`/ask-codex` starts a Codex chat and `/ask-claude` a Claude Code chat, from either app. Each can name a model and a reasoning effort, and Claude chats a permission mode (`plan` or `manual` to read only, `acceptEdits` to change files in a worktree). Codex chats appear in the Codex app's list. A Claude chat is opened in the Claude desktop app when you ask for that (`showInDesktop`). What agents may choose, and how many chats they may start, is capped by your policy: `claude-codex-mcp-bridge policy` shows it. Claude workers need the CLI signed in once with `claude auth login`.
 
 Use the lower-level modes below only when you need visible multi-turn communication between conversations or several resumable workers.
 
@@ -97,7 +100,7 @@ Use bridge_orchestrate_codex with:
 - includeUncommitted: <true if Codex must see my uncommitted edits>
 - maxRounds: 6
 
-If the status is running_codex, continue other work; the result arrives in your mailbox from "bridge", or call bridge_orchestration_wait with the runId. If Codex returns waiting_for_fable, answer the question and immediately call bridge_continue_codex with the same runId. Continue without asking me to relay messages. Check observedChanges against what Codex reports before calling the work done.
+If the status is running_codex, continue other work; the result arrives in your mailbox from "bridge", or call bridge_orchestration_wait with the runId. If Codex returns waiting_for_fable, answer the question and immediately call bridge_continue_run with the same runId. Continue without asking me to relay messages. Check observedChanges against what Codex reports before calling the work done.
 
 Do not commit, push, merge, deploy, publish, send externally, change credentials, delete data, or mutate production without explicit approval.
 ```

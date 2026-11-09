@@ -56,10 +56,12 @@ test("two independent MCP clients exchange and acknowledge a message", async () 
     assert.deepEqual(
       tools.tools.map((tool) => tool.name).sort(),
       [
+        "ask_claude",
         "ask_codex",
         "bridge_ack",
         "bridge_agents",
         "bridge_continue_codex",
+        "bridge_continue_run",
         "bridge_inbox",
         "bridge_orchestrate_codex",
         "bridge_orchestration_status",

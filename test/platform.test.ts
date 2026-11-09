@@ -53,10 +53,12 @@ test("Codex executable resolution prefers explicit configuration on every platfo
 });
 
 test("Codex executable resolution uses the bundled macOS binary when installed", () => {
-  assert.equal(
-    resolveCodexBinary({ platform: "darwin", bundledMacExists: true }),
-    "/Applications/ChatGPT.app/Contents/Resources/codex",
-  );
+  const current = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
+  const legacy = "/Applications/ChatGPT.app/Contents/Resources/codex";
+  assert.equal(resolveCodexBinary({ platform: "darwin", exists: () => true }), current, "the current app layout wins");
+  assert.equal(resolveCodexBinary({ platform: "darwin", exists: (path) => path === current }), current);
+  assert.equal(resolveCodexBinary({ platform: "darwin", exists: (path) => path === legacy }), legacy, "older app builds still resolve");
+  assert.equal(resolveCodexBinary({ platform: "darwin", exists: () => false }), "codex");
 });
 
 test("Codex executable resolution falls back to PATH on Linux and Windows", () => {

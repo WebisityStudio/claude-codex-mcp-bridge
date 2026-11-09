@@ -12,3 +12,7 @@ Inspect the current repository and report only substantive findings. Prioritise 
 
 ${SAFETY_BOUNDARY}`;
 }
+
+export function buildClaudeReadOnlyTask(request: string): string {
+  return `Answer the following request by inspecting the repository. Do not edit files or change repository state. Report what you find with file and line references and real evidence; if there is nothing substantive to report, say so directly.\n\nUser request:\n${request.trim()}\n\n${SAFETY_BOUNDARY}`;
+}

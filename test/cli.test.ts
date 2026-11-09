@@ -13,6 +13,7 @@ import {
   resolveSkillTargets,
   supportedNode,
 } from "../src/cli-logic.js";
+import { bundledClaudeBinary, bundledClaudeRoot } from "../src/claude-binary.js";
 import { codexConfigPath, readCodexServerEntry, updateCodexServerEntry } from "../src/codex-config.js";
 import { defaultDbPath, runtimePrefix, worktreeRoot } from "../src/paths.js";
 import {
@@ -55,12 +56,29 @@ test("CLI parser recognises commands, flags, values and bad input", () => {
 
 test("setup prefers the newest desktop-bundled Claude Code", () => {
   assert.equal(newestVersion(["2.1.275", "2.1.280", "2.1.99", "junk"]), "2.1.280");
-  assert.equal(
-    resolveClaudeBinary({ bundledRoot: "/bundle", bundledVersions: ["2.1.275", "2.1.280"] }),
-    join("/bundle", "2.1.280", "claude.app", "Contents", "MacOS", "claude"),
-  );
-  assert.equal(resolveClaudeBinary({ configured: "/custom/claude", bundledRoot: "/bundle", bundledVersions: ["2.1.280"] }), "/custom/claude");
-  assert.equal(resolveClaudeBinary({ bundledRoot: "/bundle", bundledVersions: [] }), "claude");
+  assert.equal(resolveClaudeBinary({ bundled: "/bundle/2.1.280/claude" }), "/bundle/2.1.280/claude");
+  assert.equal(resolveClaudeBinary({ configured: "/custom/claude", bundled: "/bundle/2.1.280/claude" }), "/custom/claude");
+  assert.equal(resolveClaudeBinary({ bundled: null }), "claude");
+
+  // The desktop app has shipped Claude Code as <version>/claude.app and as <version>/<build>/claude.app.
+  const root = mkdtempSync(join(tmpdir(), "bundled-claude-"));
+  const binary = (...parts: string[]) => join(root, ...parts, "claude.app", "Contents", "MacOS", "claude");
+  const install = (...parts: string[]) => {
+    mkdirSync(join(binary(...parts), ".."), { recursive: true });
+    writeFileSync(binary(...parts), "");
+  };
+  assert.equal(bundledClaudeBinary(root), null);
+  install("2.1.99");
+  assert.equal(bundledClaudeBinary(root), binary("2.1.99"));
+  install("2.1.309", "5af865b9901c");
+  install("2.1.317", "91184d3d9ba3");
+  mkdirSync(join(root, "2.1.400"), { recursive: true }); // A version folder still downloading.
+  assert.equal(bundledClaudeBinary(root), binary("2.1.317", "91184d3d9ba3"), "the nested layout is found and the newest complete version wins");
+  assert.equal(bundledClaudeBinary(join(root, "missing")), null);
+  assert.equal(bundledClaudeBinary(null), null);
+  assert.equal(bundledClaudeRoot("/Users/me", "linux"), null);
+  assert.equal(bundledClaudeRoot("/Users/me", "darwin"), join("/Users/me", "Library", "Application Support", "Claude", "claude-code"));
+
   assert.equal(parseCliCommand(["setup", "--node", "/opt/homebrew/bin/node"]).node, "/opt/homebrew/bin/node");
   const plan = buildRegistrationPlan({ packageRoot: "/p", nodeBinary: "/n", claudeBinary: "/bundle/claude" });
   assert.equal(plan.claude.add[0], "/bundle/claude");
